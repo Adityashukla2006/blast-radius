@@ -68,23 +68,21 @@ class PythonParser:
         self._attach_calls(root, by_node)
         return ParsedFile(path, list(by_node.values()), self._collect_imports(root))
 
-    def _get_functions(self, source : bytes):
-        tree = self.parse(source)
-        results = []
-        for _, captures in QueryCursor(FUNCTION_QUERY).matches(tree.root_node):
+    def _get_functions(self, root: Node) -> dict[int, FunctionInfo]:
+        results: dict[int, FunctionInfo] = {}
+        for _, captures in QueryCursor(FUNCTION_QUERY).matches(root):
             fn_node = captures["function"][0]
             name = captures["name"][0].text.decode()
-            span = fn_node.parent if fn_node.parent.type == "decorated_defintion" else fn_node
+            span = fn_node.parent if fn_node.parent.type == "decorated_definition" else fn_node
 
-            results.append(
-                FunctionInfo(
-                    name=name,
-                    qualname=".".join([*self._enclosing_scopes(fn_node), name]),
-                    start_line=span.start_point.row + 1,
-                    end_line=span.end_point.row + 1,
-                )
+            # keyed by the function_definition node (not the decorated span) to match _innermost_function
+            results[fn_node.start_byte] = FunctionInfo(
+                name=name,
+                qualname=".".join([*self._enclosing_scopes(fn_node), name]),
+                start_line=span.start_point.row + 1,
+                end_line=span.end_point.row + 1,
             )
-        return results 
+        return results
 
     @staticmethod
     def _enclosing_scopes(node : Node):
