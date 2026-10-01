@@ -14,11 +14,31 @@ FUNCTION_QUERY = Query(
 )
 CALL_QUERY = Query(PY_LANGUAGE, "(call function: (_) @callee) @call")
 
+EXPRESSION_QUERY = Query(
+    PY_LANGUAGE,
+
+    """
+    (module
+        (expression_statement
+            (assignment
+                left: (identifier) @name
+            )
+        ) @expression
+    )
+    """,
+)
+
 @dataclass
 class CallSite:
     name: str
     receiver: str | None
     line: int
+
+@dataclass
+class Expression:
+    name : str
+    start_line : int
+    end_line : int
 
 @dataclass
 class FunctionInfo: 
@@ -33,6 +53,7 @@ class ParsedFile:
     path: str
     functions: list[FunctionInfo]
     imports: dict[str, tuple[str, str | None]]
+    expressions : list[Expression] = field(default_factory = list)
 
 def _text(node: Node, field_name: str) -> str:
     child = node.child_by_field_name(field_name)
@@ -64,9 +85,22 @@ class PythonParser:
 
     def parse_file(self, path: str, source: bytes) -> ParsedFile:
         root = self.parser.parse(source).root_node
+        exp = self._get_expressions(root)
         by_node = self._get_functions(root)
         self._attach_calls(root, by_node)
-        return ParsedFile(path, list(by_node.values()), self._collect_imports(root))
+        return ParsedFile(path, list(by_node.values()), self._collect_imports(root),list(exp.values()))
+    
+    def _get_expressions(self, root : Node) -> dict[int, Expression]:
+        exp : dict[int, Expression] = {}
+        for _, captures in QueryCursor(EXPRESSION_QUERY).matches(root):
+            exp_node = captures["expression"][0]
+            name = captures["name"][0].text.decode()
+            exp[exp_node.start_byte] = Expression(
+                name = name,
+                start_line = exp_node.start_point.row + 1,
+                end_line = exp_node.end_point.row + 1,
+            )
+        return exp
 
     def _get_functions(self, root: Node) -> dict[int, FunctionInfo]:
         results: dict[int, FunctionInfo] = {}
@@ -123,3 +157,16 @@ class PythonParser:
                     else:  # from x import y
                         imports[child.text.decode()] = (module, child.text.decode())
         return imports
+
+# def main():
+#     p = PythonParser()
+#     with open(
+#     r"C:\Users\yashi\OneDrive\Documents\blast-radius\bench\targets\cat-hackathon\backend\app\agents\assistant.py",
+#     "rb"
+#         ) as f:
+#         source = f.read()
+    
+#     result = p.parse_file(r"C:\Users\yashi\OneDrive\Documents\blast-radius\bench\targets\cat-hackathon\backend\app\agents\assistant.py",source)
+
+# if __name__=="__main__":
+#     main()

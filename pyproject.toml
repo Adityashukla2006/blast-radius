@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Predict which parts of a Python codebase a change could break."
 requires-python = ">=3.11"
 dependencies = [
-    "tree-sitter>=0.23",
+    "tree-sitter>=0.23,<0.26",   # 0.26.0 segfaults on Windows (node.parent walks + start_point)
     "tree-sitter-python>=0.23",
     "networkx>=3.0",
 ]
