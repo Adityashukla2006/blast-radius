@@ -32,6 +32,7 @@ class Resolver:
         self.top_level: dict[str, dict[str, FunctionInfo]] = {}
         self.graph = nx.DiGraph()
         self.stats: Counter = Counter()
+        self.variables: dict[str, dict[str, Expression]] = {} 
 
     @staticmethod
     def node_id(module: str, fn: FunctionInfo) -> str:
@@ -50,8 +51,17 @@ class Resolver:
 
                 self.files[mod] = parsed
                 self.top_level[mod] = {f.name: f for f in parsed.functions if "." not in f.qualname}
-                for fn in parsed.functions:
-                    self.graph.add_node(self.node_id(mod, fn), file=rel, start=fn.start_line, end=fn.end_line)
+                self.variables[mod] = {e.name: e for e in parsed.expressions}
+                for item in [*parsed.functions, *parsed.expressions]:
+                    if isinstance(item, FunctionInfo):
+                        node, kind = self.node_id(mod, item), "function"
+                        if "." not in item.qualname:          # only top-level functions are importable
+                            self.top_level[mod][item.name] = item
+                    else:
+                        node, kind = f"{mod}:{item.name}", "variable"
+                        self.variables[mod][item.name] = item
+                    self.graph.add_node(node, file=rel, start=item.start_line, end=item.end_line, kind=kind)
+
 
     def resolve(self, mod: str, is_pkg: bool, parsed: ParsedFile, call) -> tuple[str, str] | None:
         if call.receiver is not None:
@@ -91,3 +101,11 @@ class Resolver:
         self.index()
         self.link()
         return self.graph
+
+def main():
+    r = Resolver(r"C:\Users\yashi\OneDrive\Documents\blast-radius\bench\targets\cat-hackathon")
+    r.index()
+    print(r.build())
+
+if __name__ == "__main__":
+    main()
