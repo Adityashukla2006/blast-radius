@@ -423,3 +423,105 @@ def test_variable_with_two_classes_links_both_as_typed(tmp_path):
                                    f"    user = {second}()\n    user.save()\n"})
         assert call_edges(tmp_path) == {("api:f", "models:User.save", "typed"),
                                         ("api:f", "models:Admin.save", "typed")}
+
+
+# ---- issue 29: pytest fixtures --------------------------------------------------------------------------
+
+def fixture_edges(root: Path) -> set[tuple[str, str]]:
+    g = Resolver(root, use_cache=False).build()
+    return {(a, b) for a, b, d in g.edges(data=True) if d["resolution"] == "fixture"}
+
+
+def test_test_links_to_fixture_in_conftest_above_it(tmp_path):
+    write(tmp_path, {
+        "tests/conftest.py": "import pytest\n\n@pytest.fixture(scope='session')\ndef db():\n    pass\n",
+        "tests/unit/test_x.py": "def test_a(db):\n    pass\n\ndef helper(db):\n    pass\n",
+    })
+    # helper is not a test or a fixture, so its parameter is just a parameter
+    assert fixture_edges(tmp_path) == {("tests.unit.test_x:test_a", "tests.conftest:db")}
+
+
+def test_closest_fixture_wins_and_override_uses_outer(tmp_path):
+    write(tmp_path, {
+        "tests/conftest.py": "import pytest\n\n@pytest.fixture\ndef db():\n    pass\n",
+        "tests/test_x.py": "import pytest\n\n@pytest.fixture\ndef db(db):\n    pass\n\ndef test_a(db):\n    pass\n",
+    })
+    assert fixture_edges(tmp_path) == {
+        ("tests.test_x:test_a", "tests.test_x:db"),        # the closest one
+        ("tests.test_x:db", "tests.conftest:db"),          # it overrides, and uses the outer one
+    }
+
+
+def test_autouse_usefixtures_and_renamed_fixtures(tmp_path):
+    write(tmp_path, {
+        "tests/conftest.py": (
+            "import pytest\n\n@pytest.fixture(autouse=True)\ndef fake_llm():\n    pass\n\n"
+            "@pytest.fixture(name='client')\ndef make_client():\n    pass\n\n"
+            "@pytest.fixture\ndef clean():\n    pass\n"
+        ),
+        "tests/test_x.py": "import pytest\n\n@pytest.mark.usefixtures('clean')\ndef test_a(client):\n    pass\n",
+    })
+    assert fixture_edges(tmp_path) == {
+        ("tests.test_x:test_a", "tests.conftest:fake_llm"),
+        ("tests.test_x:test_a", "tests.conftest:make_client"),
+        ("tests.test_x:test_a", "tests.conftest:clean"),
+    }
+
+
+def test_fixture_return_gives_the_parameter_type(tmp_path):
+    write(tmp_path, {
+        "app/__init__.py": "",
+        "app/llm.py": "class FakeLLM:\n    def on(self):\n        pass\n",
+        "tests/conftest.py": "import pytest\n\n@pytest.fixture\ndef llm():\n"
+                             "    from app.llm import FakeLLM\n    fake = FakeLLM()\n    yield fake\n",
+        "tests/test_x.py": "def test_a(llm):\n    llm.on()\n",
+    })
+    assert ("tests.test_x:test_a", "app.llm:FakeLLM.on", "typed") in labelled_edges(tmp_path)
+
+
+# ---- issue 15: functions passed as values ---------------------------------------------------------------
+
+def test_functions_and_classes_passed_as_arguments(tmp_path):
+    write(tmp_path, {
+        "work.py": "def advise():\n    pass\n\ndef lifespan():\n    pass\n\nclass Runtime:\n"
+                   "    def __init__(self):\n        pass\n",
+        "app.py": (
+            "import asyncio\nfrom work import advise, lifespan, Runtime\n\n"
+            "async def route(db):\n"
+            "    await asyncio.to_thread(advise, db)\n"          # positional; db is a variable: skipped
+            "    FastAPI(lifespan=lifespan)\n"                    # keyword
+            "    await asyncio.to_thread(Runtime)\n"              # a class: built later
+        ),
+    })
+    refs = {(a, b) for a, b, label in labelled_edges(tmp_path) if label == "reference"}
+    assert refs == {("app:route", "work:advise"), ("app:route", "work:lifespan"),
+                    ("app:route", "work:Runtime"), ("app:route", "work:Runtime.__init__")}
+
+
+def test_method_passed_as_callback(tmp_path):
+    write(tmp_path, {
+        "m.py": "class Hub:\n    def start(self):\n        loop.call_soon(self.tick)\n    def tick(self):\n        pass\n",
+    })
+    assert ("m:Hub.start", "m:Hub.tick", "reference") in labelled_edges(tmp_path)
+
+
+def test_import_inside_function(tmp_path):
+    write(tmp_path, {
+        "nodes.py": "def sentinel_node():\n    pass\n",
+        "graph.py": "def default_graph():\n    from nodes import sentinel_node\n"
+                    "    return build_graph(sentinel=sentinel_node)\n\ndef build_graph(sentinel):\n    pass\n",
+    })
+    assert ("graph:default_graph", "nodes:sentinel_node", "reference") in labelled_edges(tmp_path)
+
+
+def test_stronger_label_wins_when_two_rules_link_the_same_pair(tmp_path):
+    # f both calls helper() and passes helper along: keep "local" (0.9), not "reference" (0.8)
+    write(tmp_path, {"m.py": "def helper():\n    pass\n\ndef f():\n    helper()\n    run(helper)\n"})
+    assert labelled_edges(tmp_path) == {("m:f", "m:helper", "local")}
+
+
+def test_function_without_return_type_uses_its_return_lines(tmp_path):
+    write(tmp_path, {"models.py": MODELS,
+                     "api.py": "from models import Admin\n\ndef load():\n    return Admin()\n\n"
+                               "def f():\n    a = load()\n    a.save()\n"})
+    assert ("api:f", "models:Admin.save", "typed") in call_edges(tmp_path)

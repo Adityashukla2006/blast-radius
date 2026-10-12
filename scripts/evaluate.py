@@ -45,10 +45,12 @@ RESULTS = Path(__file__).resolve().parents[1] / "bench" / "results"
 
 def run_tests(python: str, tests_dir: Path, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
-    cmd = [python, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+    cmd = [python, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "blast_radius_eval_plugin",
            "--cov=.", "--cov-context=test", "--cov-report=", f"--junitxml={out / 'junit.xml'}"]
     print(f"Running the test suite once under coverage (cwd={tests_dir}) ...", flush=True)
-    env = {**os.environ, "COVERAGE_FILE": str(out / ".coverage")}
+    plugin_dir = str(Path(__file__).resolve().parent)
+    env = {**os.environ, "COVERAGE_FILE": str(out / ".coverage"), "BLAST_RADIUS_FIXTURES": str(out / "fixtures.json"),
+           "PYTHONPATH": os.pathsep.join(filter(None, [plugin_dir, os.environ.get("PYTHONPATH")]))}
     subprocess.run(cmd, cwd=tests_dir, env=env, check=False)   # failing tests are fine: they are dropped
 
 
@@ -116,11 +118,19 @@ def test_node(pytest_id: str, tests_dir_rel: str) -> str:
     return f"{module_name(rel)}:{'.'.join(n.split('[')[0] for n in names)}"
 
 
-def ground_truth(resolver: Resolver, graph, tests_dir: Path, out: Path) -> dict[str, set[str]]:
+def ground_truth(resolver: Resolver, graph, tests_dir: Path, out: Path) -> tuple[dict[str, set[str]], set[str]]:
+    """({function: tests that really use it}, {tests that passed})."""
     repo = resolver.repo.resolve()
     tests_dir_rel = tests_dir.resolve().relative_to(repo).as_posix()
     passed = passing_tests(out / "junit.xml", resolver, tests_dir_rel)
     lines = covered_lines(out / ".coverage")
+    # shared fixture context -> every test that uses that fixture (written by blast_radius_eval_plugin)
+    fixture_users: dict[str, list[str]] = defaultdict(list)
+    fixtures_file = out / "fixtures.json"
+    if fixtures_file.exists():
+        for test, fixtures in json.loads(fixtures_file.read_text()).items():
+            for fixture in fixtures:
+                fixture_users[fixture].append(test)
 
     # functions per file, with the range of their body
     spans: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
@@ -144,7 +154,7 @@ def ground_truth(resolver: Resolver, graph, tests_dir: Path, out: Path) -> dict[
             if not covering:
                 continue
             fn = min(covering)[1]                         # innermost function, like diff.changed_functions
-            for t in tests:
+            for t in {u for c in tests for u in (fixture_users.get(c, []) if c.startswith("fixture::") else [c])}:
                 node = test_node(t, tests_dir_rel)
                 if node not in graph:
                     unknown_tests.add(t)
@@ -153,7 +163,9 @@ def ground_truth(resolver: Resolver, graph, tests_dir: Path, out: Path) -> dict[
     print(f"  {len(passed)} passing tests; ground truth for {len(actual)} functions")
     if unknown_tests:
         print(f"  note: {len(unknown_tests)} test ids did not match a graph node, e.g. {sorted(unknown_tests)[:3]}")
-    return actual
+    if not fixtures_file.exists():
+        print("  note: no fixtures.json, so shared fixtures count for their first test only (use --rerun)")
+    return actual, passed
 
 
 # ---- 3. compare -----------------------------------------------------------------------------------
@@ -162,12 +174,13 @@ def is_test_node(graph, node: str) -> bool:
     return "tests" in Path(graph.nodes[node]["file"]).parts or Path(graph.nodes[node]["file"]).name.startswith("test_")
 
 
-def evaluate(graph, actual: dict[str, set[str]], min_score: float) -> dict:
+def evaluate(graph, actual: dict[str, set[str]], passed: set[str], min_score: float) -> dict:
     rows = []
     for fn, real in actual.items():
         if is_test_node(graph, fn):
             continue                                      # we score changes to app code, not to tests
-        picked = {i.node for i in blast_radius(graph, {fn}, min_score) if i.is_test}
+        # a test that did not pass (e.g. it needs a database) has no ground truth, so it can't count either way
+        picked = {i.node for i in blast_radius(graph, {fn}, min_score) if i.is_test and i.node in passed}
         hit = picked & real
         rows.append({
             "function": fn,
@@ -223,7 +236,7 @@ def main() -> None:
     repo = Path(args.repo)
     tests_dir = repo / args.tests_dir
     out = RESULTS / repo.resolve().name
-    if args.rerun or not (out / ".coverage").exists():
+    if args.rerun or not (out / ".coverage").exists() or not (out / "fixtures.json").exists():
         run_tests(str(Path(args.python).resolve()), tests_dir, out)
 
     results, actual = {}, None
@@ -231,8 +244,8 @@ def main() -> None:
         resolver = Resolver(repo, guess=guess)
         graph = resolver.build()
         if actual is None:                                # the guess adds edges, never nodes: reuse it
-            actual = ground_truth(resolver, graph, tests_dir, out)
-        results["guess on" if guess else "guess off"] = evaluate(graph, actual, args.min_score)
+            actual, passed = ground_truth(resolver, graph, tests_dir, out)
+        results["guess on" if guess else "guess off"] = evaluate(graph, actual, passed, args.min_score)
 
     print(f"\nFunctions scored: {results['guess on']['functions']} (app functions that at least one passing test runs)")
     print(f"{'':12} {'recall':>7} {'precision':>10} {'all found':>10} {'none found':>11} {'tests: real':>12} {'picked':>7}")

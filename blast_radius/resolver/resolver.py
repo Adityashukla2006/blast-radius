@@ -1,13 +1,15 @@
 import os
+import re
 import subprocess
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import networkx as nx
 
 from ..cache.cache import FALLBACK_DIR, ParseCache
+from ..impact.impact import CONFIDENCE, DEFAULT_CONFIDENCE, looks_like_test
 from ..parser.parser import (
     EXPR_RECEIVER,
     CallSite,
@@ -27,6 +29,17 @@ SELF_RECEIVERS = {"self", "cls"}
 BUILTIN_METHODS = {n for t in (object, dict, list, set, frozenset, str, bytes, tuple, int, float) for n in dir(t)}
 # typing wrappers whose arguments are the real types: Optional[User] -> User
 TYPE_WRAPPERS = {"Optional", "Union", "Annotated", "Final", "ClassVar"}
+FIXTURE_DECORATOR = re.compile(r"^(pytest\.)?fixture\b")          # @pytest.fixture, @fixture(scope=...)
+USEFIXTURES = re.compile(r"^(pytest\.)?mark\.usefixtures\(")
+NOT_FIXTURES = {"self", "cls"}
+
+def fixture_name(fn: FunctionInfo) -> tuple[str, bool] | None:
+    """(name, autouse) when fn is a pytest fixture. @pytest.fixture(name="x") renames it."""
+    for decorator in fn.decorators:
+        if FIXTURE_DECORATOR.match(decorator):
+            renamed = re.search(r"name\s*=\s*['\"](\w+)", decorator)
+            return (renamed.group(1) if renamed else fn.name), "autouse=True" in decorator.replace(" ", "")
+    return None
 
 def _split_top(text: str, sep: str) -> list[str]:
     """Split on sep, but not inside brackets: "dict[str, A], B" on "," -> ["dict[str, A]", " B"]."""
@@ -130,6 +143,9 @@ class Resolver:
         self.functions: dict[str, FunctionInfo] = {}          # node id -> function
         self.methods: dict["Symbol", list[FunctionInfo]] = {}  # class -> methods written in its body
         self.method_owners: dict[str, list[str]] = {}         # method name -> node ids of every such method
+        self.fixtures: dict[str, dict[str, str]] = {}         # module -> fixture name -> node id
+        self.autouse: dict[str, list[str]] = {}               # module -> autouse fixture node ids
+        self.ref_stats: Counter = Counter()                   # functions passed as values, by label
         self.files: dict[str, ParsedFile] = {}
         self.top_level: dict[str, dict[str, FunctionInfo]] = {}
         self.classes: dict[str, dict[str, ClassInfo]] = {}   # module -> class qualname -> class, nested too
@@ -170,6 +186,12 @@ class Resolver:
                 if fn.class_qualname is not None and fn.qualname == f"{fn.class_qualname}.{fn.name}":
                     self.methods.setdefault(Symbol("class", mod, fn.class_qualname), []).append(fn)
                     self.method_owners.setdefault(fn.name, []).append(self.node_id(mod, fn))
+                fixture = fixture_name(fn) if "." not in fn.qualname else None
+                if fixture is not None:
+                    name, autouse = fixture
+                    self.fixtures.setdefault(mod, {})[name] = self.node_id(mod, fn)
+                    if autouse:
+                        self.autouse.setdefault(mod, []).append(self.node_id(mod, fn))
             for cls in parsed.classes:
                 self.classes[mod][cls.qualname] = cls
                 self.graph.add_node(f"{mod}:{cls.qualname}", file=rel, start=cls.start_line, end=cls.end_line,
@@ -221,13 +243,7 @@ class Resolver:
         if parsed is None:
             return None
         if name in parsed.imports:
-            src, symbol = parsed.imports[name]
-            src_mod = self.canonical(absolute_module(module, self._is_pkg(module), src))
-            if src_mod is None:
-                return None                 # third-party or standard library
-            if symbol is None:              # import x / import a.b as c: the name is a module
-                return Symbol("module", src_mod)
-            return self.find_symbol(src_mod, symbol, seen)
+            return self.import_symbol(module, *parsed.imports[name], seen)
         for star in parsed.star_imports:
             src_mod = self.canonical(absolute_module(module, self._is_pkg(module), star))
             found = self.find_symbol(src_mod, name, seen) if src_mod else None
@@ -235,14 +251,26 @@ class Resolver:
                 return found
         return None
 
-    def resolve_dotted(self, module: str, dotted: str) -> tuple[Symbol, str] | None:
-        """Resolve a name as written in `module`, like "query", "db.query" or "User.create".
+    def import_symbol(self, module: str, src: str, symbol: str | None, seen: set | None = None) -> Symbol | None:
+        """Follow one import written in `module`: `from src import symbol`, or `import src` when symbol is None."""
+        src_mod = self.canonical(absolute_module(module, self._is_pkg(module), src))
+        if src_mod is None:
+            return None                     # third-party or standard library
+        if symbol is None:                  # import x / import a.b as c: the name is a module
+            return Symbol("module", src_mod)
+        return self.find_symbol(src_mod, symbol, seen)
+
+    def resolve_dotted(self, module: str, dotted: str, fn: FunctionInfo | None = None) -> tuple[Symbol, str] | None:
+        """Resolve a name as written in `module` (inside `fn`, if given), like "query", "db.query" or "User.create".
 
         Returns the symbol and the edge label: local, import, module or class.
         """
         first, *rest = dotted.split(".")
-        # Python never binds a submodule by itself, so a bare name must come from this file or its imports
-        current = self.find_symbol(module, first, submodules=False)
+        if fn is not None and first in fn.imports:      # an import inside the function hides outer names
+            current = self.import_symbol(module, *fn.imports[first])
+        else:
+            # Python never binds a submodule by itself, so a bare name must come from this file or its imports
+            current = self.find_symbol(module, first, submodules=False)
         if current is None:
             return None             # local variable, parameter, builtin or third-party name
         label = "local" if current.module == module else "import"
@@ -339,21 +367,21 @@ class Resolver:
             return list(dict.fromkeys(classes))     # keep order, drop repeats
         return [] if any(r is not None for r in results) else None
 
-    def annotation_classes(self, module: str, text: str) -> list[Symbol]:
-        found = (self.resolve_dotted(module, name) for name in annotation_names(text))
+    def annotation_classes(self, module: str, text: str, fn: FunctionInfo | None = None) -> list[Symbol]:
+        found = (self.resolve_dotted(module, name, fn) for name in annotation_names(text))
         return [s for s, _ in filter(None, found) if s.kind == "class"]
 
     def hint_classes(self, module: str, fn: FunctionInfo | None, hint: ValueHint, hops: int) -> list[Symbol] | None:
         if hint.kind == "annotation":                 # x: User
-            return self.annotation_classes(module, hint.text)
+            return self.annotation_classes(module, hint.text, fn)
         if hint.kind == "name":                       # x = other_variable
             return None if "." in hint.text else self.var_types(module, fn, hint.text, hops + 1)
-        found = self.resolve_dotted(module, hint.text)  # x = User() or x = load()
+        found = self.resolve_dotted(module, hint.text, fn)  # x = User() or x = load()
         if found is None:
             first = hint.text.split(".")[0]
-            parsed = self.files[module]
-            if first in parsed.imports and self.canonical(
-                    absolute_module(module, self._is_pkg(module), parsed.imports[first][0])) is None:
+            imports = {**self.files[module].imports, **(fn.imports if fn is not None else {})}
+            if first in imports and self.canonical(
+                    absolute_module(module, self._is_pkg(module), imports[first][0])) is None:
                 return []                             # x = requests.get(): third-party value
             return None
         symbol = found[0]
@@ -361,9 +389,19 @@ class Resolver:
             return [symbol]
         if symbol.kind == "function":
             info = self.functions.get(symbol.node)
-            if info is not None and info.return_type:  # def load() -> User
-                return self.annotation_classes(symbol.module, info.return_type)
+            return self.function_returns(symbol.module, info, hops) if info is not None else None
         return None
+
+    def function_returns(self, module: str, info: FunctionInfo, hops: int) -> list[Symbol] | None:
+        """Repo classes a function gives back: from `-> User`, else from its `return` / `yield` lines."""
+        declared = self.annotation_classes(module, info.return_type, info) if info.return_type else []
+        if declared:
+            return declared
+        if info.return_hints and hops < MAX_TYPE_HOPS:   # -> Iterator[Session] says little; `yield db` may say more
+            found = self._combine(self.hint_classes(module, info, h, hops + 1) for h in info.return_hints)
+            if found is not None:
+                return found
+        return [] if info.return_type else None
 
     def var_types(self, module: str, fn: FunctionInfo | None, name: str, hops: int = 0) -> list[Symbol] | None:
         """Repo classes that variable `name` can hold inside `fn` (or at module level when fn is None)."""
@@ -372,7 +410,12 @@ class Resolver:
         if fn is not None:
             if name in fn.params:                     # a parameter hides any outer name
                 annotation = fn.params[name]
-                return self.annotation_classes(module, annotation) if annotation else None
+                if annotation:
+                    return self.annotation_classes(module, annotation, fn)
+                fixture = self.find_fixture(module, name, self.node_id(module, fn)) if self.uses_fixtures(module, fn) else None
+                if fixture is not None:               # def test_x(fake_llm): whatever the fixture gives back
+                    return self.function_returns(fixture.split(":")[0], self.functions[fixture], hops + 1)
+                return None
             if name in fn.local_types:
                 return self._combine(self.hint_classes(module, fn, h, hops) for h in fn.local_types[name])
         var = self.variables.get(module, {}).get(name)
@@ -412,7 +455,86 @@ class Resolver:
         owners = self.method_owners.get(name, [])
         return [(owners[0], "name-match")] if len(owners) == 1 else []
 
+    # ---- pytest fixtures ---------------------------------------------------------------------------
+
+    def fixture_scopes(self, module: str) -> list[str]:
+        """Where pytest looks for a fixture used in `module`: the module, then each conftest.py above it."""
+        scopes = [module]
+        for folder in PurePosixPath(self.files[module].path).parents:
+            conftest = module_name("conftest.py" if str(folder) == "." else f"{folder}/conftest.py")
+            if conftest in self.files and conftest != module:
+                scopes.append(conftest)
+        return scopes
+
+    def find_fixture(self, module: str, name: str, skip: str | None = None) -> str | None:
+        """Node id of the fixture `name` as seen from `module`; the closest one wins.
+
+        `skip` lets a fixture that overrides one with the same name use the outer one.
+        """
+        for scope in self.fixture_scopes(module):
+            node = self.fixtures.get(scope, {}).get(name)
+            if node is not None and node != skip:
+                return node
+        return None
+
+    def uses_fixtures(self, module: str, fn: FunctionInfo) -> bool:
+        node = self.node_id(module, fn)
+        return looks_like_test(self.files[module].path, fn.name) or node in self.fixtures.get(module, {}).values()
+
+    def fixture_targets(self, module: str, fn: FunctionInfo) -> list[str]:
+        """Fixtures pytest runs before `fn`: its parameters, usefixtures(...), and autouse fixtures."""
+        node = self.node_id(module, fn)
+        names = [p for p in fn.params if p not in NOT_FIXTURES]
+        for decorator in fn.decorators:
+            if USEFIXTURES.match(decorator):
+                names += re.findall(r"['\"](\w+)['\"]", decorator)
+        targets = [t for t in (self.find_fixture(module, n, node) for n in names) if t is not None]
+        if looks_like_test(self.files[module].path, fn.name):
+            for scope in self.fixture_scopes(module):
+                targets += self.autouse.get(scope, [])
+        return [t for t in dict.fromkeys(targets) if t != node]
+
+    # ---- functions passed as values ----------------------------------------------------------------
+
+    def resolve_ref(self, mod: str, caller: FunctionInfo, ref: CallSite) -> list[tuple[str, str]]:
+        """to_thread(advise, ...), add_node("x", node_fn), FastAPI(lifespan=lifespan), Thread(target=self.run).
+
+        Only names that turn out to be repo functions or classes count; variables are skipped.
+        """
+        if ref.receiver in SELF_RECEIVERS:
+            if caller.class_qualname is None:
+                return []
+            method = self.find_member(Symbol("class", mod, caller.class_qualname), ref.name)
+            return [(method.node, "reference")] if method is not None and method.kind == "function" else []
+        first = ref.name if ref.receiver is None else ref.receiver.split(".")[0]
+        if first in caller.params or first in caller.local_types:
+            return []                       # a variable, or an attribute of one
+        dotted = ref.name if ref.receiver is None else f"{ref.receiver}.{ref.name}"
+        found = self.resolve_dotted(mod, dotted, caller)
+        if found is None:
+            return []
+        symbol = found[0]
+        if symbol.kind == "function":
+            return [(symbol.node, "reference")]
+        if symbol.kind == "class":          # to_thread(ShiftRuntime, ...) builds one later
+            init = self.find_member(symbol, "__init__")
+            targets = [(symbol.node, "reference")]
+            if init is not None and init.kind == "function":
+                targets.append((init.node, "reference"))
+            return targets
+        return []
+
     # ---- edges -------------------------------------------------------------------------------------
+
+    def _add_edge(self, caller: str, callee: str, rule: str, line: int) -> None:
+        """Add an edge. If one exists between the same two nodes, keep the more confident label."""
+        if caller == callee:
+            return
+        if self.graph.has_edge(caller, callee):
+            old = self.graph.edges[caller, callee]["resolution"]
+            if CONFIDENCE.get(old, DEFAULT_CONFIDENCE) >= CONFIDENCE.get(rule, DEFAULT_CONFIDENCE):
+                return
+        self.graph.add_edge(caller, callee, resolution=rule, line=line)
 
     def resolve(self, mod: str, is_pkg: bool, parsed: ParsedFile, call: CallSite,
                 caller: FunctionInfo | None = None) -> list[tuple[str, str]]:
@@ -438,7 +560,7 @@ class Resolver:
                 return self.typed_targets(self.var_types(mod, caller, first), call.name)
 
         dotted = call.name if call.receiver is None else f"{call.receiver}.{call.name}"
-        found = self.resolve_dotted(mod, dotted)
+        found = self.resolve_dotted(mod, dotted, caller)
         if found is None:
             if call.receiver in self.variables.get(mod, {}):              # tracker = Tracker() at the top
                 return self.typed_targets(self.var_types(mod, None, call.receiver), call.name)
@@ -459,8 +581,7 @@ class Resolver:
             for qualname in classes:
                 cls = Symbol("class", mod, qualname)
                 for base in self.bases(cls):     # a change to the parent class reaches its children
-                    self.graph.add_edge(cls.node, base.node, resolution="inherits",
-                                        line=classes[qualname].start_line)
+                    self._add_edge(cls.node, base.node, "inherits", classes[qualname].start_line)
                     self._children.setdefault(base, []).append(cls)
 
         for mod, parsed in self.files.items():
@@ -474,7 +595,15 @@ class Resolver:
                         continue
                     self.stats[targets[0][1]] += 1      # count calls, not edges: Foo() can add two
                     for callee, rule in targets:
-                        self.graph.add_edge(caller, callee, resolution=rule, line=call.line)
+                        self._add_edge(caller, callee, rule, call.line)
+                for ref in fn.refs:
+                    for callee, rule in self.resolve_ref(mod, fn, ref):
+                        self.ref_stats[rule] += 1
+                        self._add_edge(caller, callee, rule, ref.line)
+                if self.uses_fixtures(mod, fn):
+                    for fixture in self.fixture_targets(mod, fn):
+                        self.ref_stats["fixture"] += 1
+                        self._add_edge(caller, fixture, "fixture", fn.start_line)
 
 
     def build(self) -> nx.DiGraph:

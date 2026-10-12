@@ -26,6 +26,8 @@ CLASS_QUERY = Query(
 EXPR_RECEIVER = "<expr>"   # receiver that is not a plain name chain: get_client().send(), items[0].save()
 
 ASSIGN_QUERY = Query(PY_LANGUAGE, "(assignment) @assign")
+RETURN_QUERY = Query(PY_LANGUAGE, "[(return_statement) (yield)] @ret")
+IMPORT_QUERY = Query(PY_LANGUAGE, "[(import_statement) (import_from_statement)] @import")
 
 EXPRESSION_QUERY = Query(
     PY_LANGUAGE,
@@ -72,6 +74,10 @@ class FunctionInfo:
     return_type: str | None = None
     local_types: dict[str, list[ValueHint]] = field(default_factory=dict)    # x = ... inside this function
     attr_assigns: dict[str, list[ValueHint]] = field(default_factory=dict)   # self.x = ... inside this function
+    decorators: list[str] = field(default_factory=list)       # as written, without "@": "pytest.fixture(autouse=True)"
+    return_hints: list[ValueHint] = field(default_factory=list)   # return User() / yield session
+    refs: list[CallSite] = field(default_factory=list)        # names passed as values: to_thread(advise, ...)
+    imports: dict[str, tuple[str, str | None]] = field(default_factory=dict)   # imports inside this function
 
 @dataclass
 class ClassInfo:
@@ -157,24 +163,72 @@ def _params(fn_node: Node) -> dict[str, str | None]:
             params[_text(p, "name")] = _text(p, "type")
     return params
 
+def _value_hints(value: Node | None) -> list[ValueHint]:
+    """Clues in a value: `load()` is a call, `other` is a name."""
+    if value is not None and value.type == "await":           # await load()
+        value = value.named_children[0] if value.named_children else None
+    if value is not None and value.type == "call":
+        callee = _dotted(value.child_by_field_name("function"))
+        if callee is not None:
+            return [ValueHint("call", callee)]
+    elif value is not None and value.type in ("identifier", "attribute"):
+        name = _dotted(value)
+        if name is not None:
+            return [ValueHint("name", name)]
+    return []
+
 def _hints(assign: Node) -> list[ValueHint]:
     """Clues in one assignment: `x: Foo = load()` gives an annotation and a call."""
     hints = []
     annotation = assign.child_by_field_name("type")
     if annotation is not None:
         hints.append(ValueHint("annotation", annotation.text.decode()))
-    right = assign.child_by_field_name("right")
-    if right is not None and right.type == "await":           # x = await load()
-        right = right.named_children[0] if right.named_children else None
-    if right is not None and right.type == "call":
-        callee = _dotted(right.child_by_field_name("function"))
-        if callee is not None:
-            hints.append(ValueHint("call", callee))
-    elif right is not None and right.type in ("identifier", "attribute"):
-        name = _dotted(right)
-        if name is not None:
-            hints.append(ValueHint("name", name))
-    return hints
+    return hints + _value_hints(assign.child_by_field_name("right"))
+
+def _decorators(fn_node: Node) -> list[str]:
+    if fn_node.parent.type != "decorated_definition":
+        return []
+    return [d.named_children[0].text.decode() for d in fn_node.parent.children
+            if d.type == "decorator" and d.named_children]
+
+def _refs(call: Node, line: int) -> list[CallSite]:
+    """Plain names given to a call as arguments: to_thread(advise, db) -> advise, db.
+
+    The callee may call them later. Most will be ordinary variables; the resolver keeps only the
+    ones that turn out to be functions or classes.
+    """
+    args = call.child_by_field_name("arguments")
+    if args is None or args.type != "argument_list":
+        return []
+    refs = []
+    for arg in args.named_children:
+        if arg.type == "keyword_argument":                    # FastAPI(lifespan=lifespan)
+            arg = arg.child_by_field_name("value")
+        dotted = _dotted(arg) if arg is not None else None
+        if dotted is not None:
+            receiver, _, name = dotted.rpartition(".")
+            refs.append(CallSite(name, receiver or None, line))
+    return refs
+
+def _bind_import(node: Node, imports: dict[str, tuple[str, str | None]], star_imports: list[str]) -> None:
+    """Record the names one import statement binds: local name -> (module, name or None for a module)."""
+    if node.type == "import_statement":
+        for child in node.named_children:
+            if child.type == "dotted_name":  # import a.b  ->  binds "a"
+                top = child.text.decode().split(".")[0]
+                imports[top] = (top, None)
+            elif child.type == "aliased_import":  # import a.b as c
+                imports[_text(child, "alias")] = (_text(child, "name"), None)
+        return
+    module = _text(node, "module_name")  # keeps leading dots: ".db"
+    if any(child.type == "wildcard_import" for child in node.children):
+        star_imports.append(module)      # from x import *
+        return
+    for child in node.children_by_field_name("name"):
+        if child.type == "aliased_import":  # from x import y as z
+            imports[_text(child, "alias")] = (module, _text(child, "name"))
+        else:  # from x import y
+            imports[child.text.decode()] = (module, child.text.decode())
 
 def _innermost_class(node: Node) -> Node | None:
     parent = node.parent
@@ -198,7 +252,7 @@ class PythonParser:
         classes = self._get_classes(root)
         self._attach_calls(root, by_node)
         self._attach_assignments(root, by_node, classes)
-        imports, star_imports = self._collect_imports(root)
+        imports, star_imports = self._collect_imports(root, by_node)
         return ParsedFile(path, list(by_node.values()), imports, list(exp.values()),
                           classes=list(classes.values()), star_imports=star_imports)
     
@@ -231,6 +285,7 @@ class PythonParser:
                 class_qualname=self._enclosing_class(fn_node),
                 params=_params(fn_node),
                 return_type=_text(fn_node, "return_type") or None,
+                decorators=_decorators(fn_node),
             )
         return results
 
@@ -299,29 +354,26 @@ class PythonParser:
             site = _call_site(callee, call.start_point.row + 1)
             if site is not None:
                 by_node[owner.start_byte].calls.append(site)
+            by_node[owner.start_byte].refs.extend(_refs(call, call.start_point.row + 1))
+        for _, caps in QueryCursor(RETURN_QUERY).matches(root):
+            ret = caps["ret"][0]
+            owner = _innermost_function(ret)
+            if owner is not None and ret.named_children:
+                by_node[owner.start_byte].return_hints.extend(_value_hints(ret.named_children[0]))
 
 
-    def _collect_imports(self, root: Node) -> tuple[dict[str, tuple[str, str | None]], list[str]]:
+    def _collect_imports(self, root: Node, by_node: dict[int, FunctionInfo]
+                         ) -> tuple[dict[str, tuple[str, str | None]], list[str]]:
+        """Module imports (also inside `if`/`try` at the top), and imports inside each function."""
         imports: dict[str, tuple[str, str | None]] = {}
         star_imports: list[str] = []
-        for node in root.children:  # top-level only; function-local imports can come later
-            if node.type == "import_statement":
-                for child in node.named_children:
-                    if child.type == "dotted_name":  # import a.b  ->  binds "a"
-                        top = child.text.decode().split(".")[0]
-                        imports[top] = (top, None)
-                    elif child.type == "aliased_import":  # import a.b as c
-                        imports[_text(child, "alias")] = (_text(child, "name"), None)
-            elif node.type == "import_from_statement":
-                module = _text(node, "module_name")  # keeps leading dots: ".db"
-                if any(child.type == "wildcard_import" for child in node.children):
-                    star_imports.append(module)      # from x import *
-                    continue
-                for child in node.children_by_field_name("name"):
-                    if child.type == "aliased_import":  # from x import y as z
-                        imports[_text(child, "alias")] = (module, _text(child, "name"))
-                    else:  # from x import y
-                        imports[child.text.decode()] = (module, child.text.decode())
+        for _, caps in QueryCursor(IMPORT_QUERY).matches(root):
+            node = caps["import"][0]
+            owner = _innermost_function(node)
+            if owner is not None:                    # def f(): from app.x import y  (often to avoid a cycle)
+                _bind_import(node, by_node[owner.start_byte].imports, [])
+            else:
+                _bind_import(node, imports, star_imports)
         return imports, star_imports
 
 # def main():

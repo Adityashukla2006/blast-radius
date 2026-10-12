@@ -64,8 +64,19 @@ def test_evaluate_scores_recall_and_precision():
     g.add_edge("tests.t:test_a", "app:f", resolution="import")
     g.add_edge("tests.t:test_c", "app:f", resolution="import")
     # really used by a and b; we pick a and c
-    result = ev.evaluate(g, {"app:f": {"tests.t:test_a", "tests.t:test_b"}}, min_score=0.05)
+    passed = {"tests.t:test_a", "tests.t:test_b", "tests.t:test_c"}
+    result = ev.evaluate(g, {"app:f": {"tests.t:test_a", "tests.t:test_b"}}, passed, min_score=0.05)
     assert result["functions"] == 1
     assert result["recall"] == 0.5
     assert result["precision"] == 0.5
     assert result["rows"][0]["missed"] == ["tests.t:test_b"]
+
+
+def test_evaluate_ignores_picks_that_did_not_pass():
+    g = nx.DiGraph()
+    for node, file in [("app:f", "app.py"), ("tests.t:test_a", "tests/t.py"), ("tests.t:test_db", "tests/t.py")]:
+        g.add_node(node, file=file, kind="function")
+    g.add_edge("tests.t:test_a", "app:f", resolution="import")
+    g.add_edge("tests.t:test_db", "app:f", resolution="import")     # needs a database, errored
+    result = ev.evaluate(g, {"app:f": {"tests.t:test_a"}}, {"tests.t:test_a"}, min_score=0.05)
+    assert result["precision"] == 1.0

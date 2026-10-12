@@ -169,7 +169,40 @@ In cat-hackathon, one run takes 2 minutes. 230 functions would take about 8 hour
 - Precision: **88%** – when we pick a test, we are almost always right.
 - The guess (issue 11) adds about 1% recall and does not hurt precision.
 
-The script also shows **where the call chains break**. That list tells us what to fix next (issues 29, 30, 31).
+The script also shows **where the call chains break**. That list tells us what to fix next.
+
+**We also fixed the measuring itself:**
+- A "session" fixture runs only once, during the first test that needs it. Coverage gave its code to that one test only.
+  But if that code breaks, *every* test using the fixture fails. A small pytest plugin now records which tests use
+  each shared fixture, so its code counts for all of them.
+- Tests that don't pass anyway (they need a Postgres database) no longer count as wrong picks.
+
+### 29. Tests didn't connect to their pytest fixtures
+**What was wrong:** `def test_x(fake_llm, db_session):` – pytest runs those fixtures first, but the test never *calls* them, so there was no arrow.
+
+**How we fixed it:** For each test (and each fixture), the tool looks up every parameter name as a fixture:
+first in the same file, then in each `conftest.py` above it. The closest one wins. It draws an arrow labelled `fixture`.
+It also handles `autouse=True` fixtures (pytest gives them to every test nearby), `@pytest.mark.usefixtures("x")`,
+and `@pytest.fixture(name="x")`.
+The fixture also tells us the parameter's type: whatever it returns or yields.
+
+### 15. Functions passed around were not seen
+**What was wrong:** `asyncio.to_thread(advise, ...)`, `build_graph(sentinel=sentinel_node)`, `FastAPI(lifespan=lifespan)` –
+the function is handed over, to be called later. There was no arrow.
+
+**How we fixed it:** When a name is given to a call as an argument, and that name is a repo function or class,
+the tool draws an arrow labelled `reference`. Variables are skipped.
+
+### 32. Imports inside functions were ignored
+**What was wrong:** `def default_graph(): from app.agents.sentinel import sentinel_node` – the parser only read imports at the top of a file.
+This is common: people do it to stop two files importing each other in a circle.
+
+**How we fixed it:** The parser now reads imports everywhere. An import inside a function only counts inside that function.
+
+**Did it work? (issues 29, 15 and 32 together)** Yes. In cat-hackathon:
+- Recall went from **28% to 49%**.
+- Precision stayed about the same: **87%** (it was 88%).
+- Example: breaking `ml/train.py:run` on purpose broke 61 tests. The tool picked exactly the 60 of them that pass normally.
 
 ### 26. `get_client().send()` looked like a plain `send()`
 **What was wrong:**
@@ -188,22 +221,7 @@ It is deleted now, and it was never saved into git.
 
 ## ⏳ To do
 
-### 29. Tests don't connect to their pytest fixtures  ⭐ next
-A test says `def test_x(fake_llm, db_session):`. pytest runs the fixture functions `fake_llm` and `db_session` first.
-But the test never *calls* them, so there is no arrow. If you change a fixture, or anything it uses, we miss the test.
-**Found by issue 20:** `fake_llm`, `db_session`, `live` and `finished` are where 650 missed tests break off.
-**Plan:** For each test parameter, find the fixture with that name (same file, or a `conftest.py` above it) and draw an arrow.
-Fixtures can use other fixtures, so do the same for them.
-Also: when the fixture says what it gives back (`-> FakeLLM`, or `return ShadowPredictor.load()`), use that as the parameter's type.
-Then the guess from issue 11 is not needed for fixtures.
-
-### 15. Functions passed around are not seen  ⭐ next
-`Thread(target=work)`, `asyncio.to_thread(advise, ...)`, `graph.add_node("sentinel", sentinel_node)`,
-`FastAPI(lifespan=lifespan)` – the function is handed over to be called later. It is not called directly, so there is no arrow.
-**Found by issue 20:** `sentinel_node`, `dispatcher_node`, `scribe_node` and `lifespan` are where 900 missed tests break off.
-**Plan:** When a function is passed as a value (not called), draw an arrow from the function that passes it.
-
-### 30. Web routes called over HTTP are not seen
+### 30. Web routes called over HTTP are not seen  ⭐ next
 A test does `client.get("/alerts")`. FastAPI then runs the function marked `@app.get("/alerts")`.
 The test never names the function, so there is no arrow.
 **Found by issue 20:** 28 route functions, for example `telemetry_ws` (145 missed tests).
@@ -228,8 +246,11 @@ A `@property` getter and its setter have the same name. The second one overwrite
 Changing `TIMEOUT = 5` should affect every function that uses `TIMEOUT`. Right now the tool says nothing breaks.
 **Plan:** Record which functions read which variables.
 
-### 16. Calls outside of functions are ignored
+### 16. Calls outside of functions are ignored  ⭐ next
 `app = create_app()` at the top of a file gets no arrow.
+**Found by issue 20:** cat-hackathon does exactly this in `main.py`, and the tests use `TestClient(app)`.
+So nothing connects the tests to `create_app` and `lifespan` (206 missed tests). This needs issue 14 too:
+the variable `app` must get an arrow to `create_app`, and the tests must get an arrow to the variable `app`.
 
 ### 17. Deleted functions are not reported
 The tool only looks at the new version of a file. A deleted function is not on the new map, so it can't be found.

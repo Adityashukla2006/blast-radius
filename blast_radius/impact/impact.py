@@ -27,16 +27,22 @@ CONFIDENCE = {   # add a line here for each new resolver rule
     "override": 0.5,      # self.validate() runs a child's version only when self is that child
     "typed": 0.8,         # user.save(), where the code shows user is a User
     "name-match": 0.3,    # user.save() with no clue about user: the only repo class with save()
+    "fixture": 0.9,       # def test_x(db_session): pytest runs the fixture db_session first
+    "reference": 0.8,     # to_thread(advise, ...): advise is handed over and called later
 }
 DEFAULT_CONFIDENCE = 0.5
 DECAY = 0.8
 MIN_SCORE = 0.05   # 0.72 ** 9 ~= 0.052, so a chain of strong edges stops after about 9 hops
 
-def is_test(graph: nx.DiGraph, node: str) -> bool:
-    file = PurePosixPath(graph.nodes[node]["file"])
-    func = node.split(":", 1)[1].split(".")[-1]      # "tests.test_api:TestX.test_get" -> "test_get"
+def looks_like_test(path: str, func_name: str) -> bool:
+    file = PurePosixPath(path)
     in_test_file = file.name.startswith("test_") or file.name.endswith("_test.py") or "tests" in file.parts
-    return in_test_file and func.startswith("test")
+    return in_test_file and func_name.startswith("test")
+
+
+def is_test(graph: nx.DiGraph, node: str) -> bool:
+    func = node.split(":", 1)[1].split(".")[-1]      # "tests.test_api:TestX.test_get" -> "test_get"
+    return looks_like_test(graph.nodes[node]["file"], func)
 
 
 def blast_radius(graph: nx.DiGraph, changed: set[str], min_score: float = MIN_SCORE) -> list[Impacted]:
