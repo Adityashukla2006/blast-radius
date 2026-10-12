@@ -148,6 +148,29 @@ Guessed arrows get a low score (0.3). Switch it off with `Resolver(repo, guess=F
 - Part 2 (guess): 46 more calls got an arrow. We checked them: they were right.
   Most were test fixtures like `predictor` and `fake_llm`, which have no type hints.
 
+### 20. We didn't know how accurate the tool is
+**What was wrong:** We had no score. So we couldn't tell if a fix really helped.
+
+**How we fixed it:** A new script, `scripts/evaluate.py`.
+1. It runs the target repo's tests one time, with "coverage" switched on.
+   Coverage writes down which lines each test ran.
+2. So for every function, we know which tests really use it. Those are the tests that break if the function breaks.
+3. Then we ask our tool: "this function changed – which tests?" and compare.
+
+We get two numbers:
+- **Recall** – of the tests that really use the function, how many did we find? (A missed test = broken code can slip through.)
+- **Precision** – of the tests we picked, how many really use the function? (An extra test = wasted time.)
+
+Breaking each function on purpose and running all tests gives the same answer, but takes one full test run per function.
+In cat-hackathon, one run takes 2 minutes. 230 functions would take about 8 hours. Coverage needs one run.
+
+**First result (cat-hackathon, 232 functions):**
+- Recall: **28%** – we find fewer than 1 in 3 of the tests that matter. This is the big problem now.
+- Precision: **88%** – when we pick a test, we are almost always right.
+- The guess (issue 11) adds about 1% recall and does not hurt precision.
+
+The script also shows **where the call chains break**. That list tells us what to fix next (issues 29, 30, 31).
+
 ### 26. `get_client().send()` looked like a plain `send()`
 **What was wrong:**
 When the part before the dot was not a simple name, the tool threw it away.
@@ -165,6 +188,34 @@ It is deleted now, and it was never saved into git.
 
 ## ⏳ To do
 
+### 29. Tests don't connect to their pytest fixtures  ⭐ next
+A test says `def test_x(fake_llm, db_session):`. pytest runs the fixture functions `fake_llm` and `db_session` first.
+But the test never *calls* them, so there is no arrow. If you change a fixture, or anything it uses, we miss the test.
+**Found by issue 20:** `fake_llm`, `db_session`, `live` and `finished` are where 650 missed tests break off.
+**Plan:** For each test parameter, find the fixture with that name (same file, or a `conftest.py` above it) and draw an arrow.
+Fixtures can use other fixtures, so do the same for them.
+Also: when the fixture says what it gives back (`-> FakeLLM`, or `return ShadowPredictor.load()`), use that as the parameter's type.
+Then the guess from issue 11 is not needed for fixtures.
+
+### 15. Functions passed around are not seen  ⭐ next
+`Thread(target=work)`, `asyncio.to_thread(advise, ...)`, `graph.add_node("sentinel", sentinel_node)`,
+`FastAPI(lifespan=lifespan)` – the function is handed over to be called later. It is not called directly, so there is no arrow.
+**Found by issue 20:** `sentinel_node`, `dispatcher_node`, `scribe_node` and `lifespan` are where 900 missed tests break off.
+**Plan:** When a function is passed as a value (not called), draw an arrow from the function that passes it.
+
+### 30. Web routes called over HTTP are not seen
+A test does `client.get("/alerts")`. FastAPI then runs the function marked `@app.get("/alerts")`.
+The test never names the function, so there is no arrow.
+**Found by issue 20:** 28 route functions, for example `telemetry_ws` (145 missed tests).
+**Plan:** Read the route paths from the decorators, and match them with the URLs the tests call.
+
+### 31. Code that Python or a library runs for you
+- **Properties:** `plan.changed` runs the `@property` function `changed`, but it looks like reading a value, not a call.
+- **Pydantic validators:** `@field_validator` functions run when a model is made.
+- **`__post_init__`** runs when a dataclass is made.
+**Found by issue 20:** together about 350 missed tests.
+**Plan:** Treat reading a property as a call. Link a class's validators and `__post_init__` to the class, like `__init__`.
+
 ### 12. Two functions with the same name squash each other
 A `@property` getter and its setter have the same name. The second one overwrites the first one on the map.
 **Plan:** Give the second one a different name, like adding its line number.
@@ -176,9 +227,6 @@ A `@property` getter and its setter have the same name. The second one overwrite
 ### 14. Variables have no arrows
 Changing `TIMEOUT = 5` should affect every function that uses `TIMEOUT`. Right now the tool says nothing breaks.
 **Plan:** Record which functions read which variables.
-
-### 15. Functions passed around are not seen
-`Thread(target=work)` or `map(fn, items)` – the function is handed over, not called directly. No arrow.
 
 ### 16. Calls outside of functions are ignored
 `app = create_app()` at the top of a file gets no arrow.
@@ -195,10 +243,6 @@ Also, when lines are deleted, the tool marks the line just before. That can be a
 `pyproject.toml` says there is a `blast-radius` command, but the file for it (`cli.py`) doesn't exist.
 **Plan:** Make `cli.py`. Add options like `--base main` and an option to run only the affected tests.
 
-### 20. We don't know how accurate the tool is
-**Plan:** Break one function on purpose in a test repo. Run all the tests. Check: did the tool pick the tests that failed?
-This gives us a score. Then we can see if each fix really helps.
-
 ### 21. Very big repos will still be slow in some places
 - The memory box is saved as one big file. Changing one file rewrites the whole thing.
 - Making the arrows (`link()`) still goes through every file each time.
@@ -206,12 +250,6 @@ This gives us a score. Then we can see if each fix really helps.
 
 ### 22. Only one arrow is kept between two functions
 If `a` calls `b` on three lines, the map keeps just the last line. This is small. It only matters for showing line numbers.
-
-### 27. Test fixtures could tell us the exact type
-In pytest, `def test_x(predictor):` gets `predictor` from a fixture function in `conftest.py`.
-That function often says what it gives back (`-> FakeLLM`), or it makes the object (`return ShadowPredictor.load()`).
-Right now the tool only guesses these by method name.
-**Plan:** Match the test's parameter name to the fixture function, and use what it gives back as the type.
 
 ### 28. Some variables are still unknown
 These are not covered yet:

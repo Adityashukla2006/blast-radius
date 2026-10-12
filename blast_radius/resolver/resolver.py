@@ -394,16 +394,16 @@ class Resolver:
         """Edges for <variable>.name() once we know which classes the variable can hold."""
         if classes is None:
             return self.guess_targets(name)
-        targets = []
+        best: dict[str, str] = {}                     # node -> label; "typed" beats "override"
         for cls in classes:
             method = self.find_member(cls, name)
             if method is not None and method.kind == "function":
-                targets.append((method.node, "typed"))
+                best[method.node] = "typed"
             for sub in self.descendants(cls):         # the value may be a subclass with its own version
                 own = self.own_method(sub, name)
                 if own is not None:
-                    targets.append((own.node, "override"))
-        return list(dict.fromkeys(targets))
+                    best.setdefault(own.node, "override")
+        return list(best.items())
 
     def guess_targets(self, name: str) -> list[tuple[str, str]]:
         """No clue about the type: if exactly one repo class has this method, guess it."""

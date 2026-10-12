@@ -413,3 +413,13 @@ def test_local_variable_hides_module_with_same_name(tmp_path):
         "api.py": "import db\nfrom models import Admin\n\ndef f():\n    db = Admin()\n    db.save()\n",
     })
     assert call_edges(tmp_path) == {("api:f", "models:Admin.save", "typed")}
+
+
+def test_variable_with_two_classes_links_both_as_typed(tmp_path):
+    # either order: Admin is a child of User, but the code also makes an Admin directly
+    for first, second in (("User", "Admin"), ("Admin", "User")):
+        write(tmp_path, {"models.py": MODELS,
+                         "api.py": f"from models import User, Admin\n\ndef f():\n    user = {first}()\n"
+                                   f"    user = {second}()\n    user.save()\n"})
+        assert call_edges(tmp_path) == {("api:f", "models:User.save", "typed"),
+                                        ("api:f", "models:Admin.save", "typed")}
