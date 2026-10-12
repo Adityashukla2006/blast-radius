@@ -16,6 +16,7 @@ r = Resolver(repo)
 g = r.build()
 total = sum(r.stats.values())
 print(f"Graph: {g.number_of_nodes()} functions, {g.number_of_edges()} edges")
+print(f"Parse cache: {r.cache.hits} reused, {r.cache.misses} parsed  ({r.cache.path})")
 for rule, n in r.stats.most_common():
     print(f"  {rule:12} {n:6}  ({n / total:.0%})")
 

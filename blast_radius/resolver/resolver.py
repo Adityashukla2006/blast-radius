@@ -1,12 +1,32 @@
 import os
+import subprocess
 from collections import Counter
 from pathlib import Path
 
 import networkx as nx
 
-from ..parser.parser import FunctionInfo, ParsedFile, PythonParser
+from ..cache.cache import FALLBACK_DIR, ParseCache
+from ..parser.parser import Expression, FunctionInfo, ParsedFile, PythonParser
 
-SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "build", "dist", "node_modules"}
+SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "build", "dist", "node_modules", FALLBACK_DIR}
+
+def python_files(repo: Path) -> list[str]:
+    """Repo-relative .py paths. In a git checkout, .gitignore decides (so cloned bench targets stay out)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "*.py"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        paths = [p for p in out.split("\0") if p]
+        # --cached still lists files deleted from disk but not yet staged
+        return [p for p in paths if not SKIP_DIRS.intersection(p.split("/")) and (repo / p).is_file()]
+    except (OSError, subprocess.CalledProcessError):
+        pass   # not a git checkout: walk the folder instead
+    files = []
+    for root, dirs, names in os.walk(repo):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]   # prune in place so os.walk skips them
+        files += [(Path(root) / n).relative_to(repo).as_posix() for n in names if n.endswith(".py")]
+    return files
 
 def module_name(rel_path : str) -> str:
     parts = Path(rel_path).with_suffix("").parts
@@ -26,8 +46,9 @@ def absolute_module(importer: str, is_package: bool, target: str) -> str:
     return ".".join(p for p in [*base, rest] if p)
 
 class Resolver:
-    def __init__(self, repo : str | Path):
+    def __init__(self, repo : str | Path, use_cache: bool = True):
         self.repo = Path(repo)
+        self.cache = ParseCache(self.repo) if use_cache else None
         self.files: dict[str, ParsedFile] = {}
         self.top_level: dict[str, dict[str, FunctionInfo]] = {}
         self.graph = nx.DiGraph()
@@ -40,28 +61,27 @@ class Resolver:
 
     def index(self) -> None:
         parser = PythonParser()
-        for root, dirs, names in os.walk(self.repo):
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]   # prune in place so os.walk skips them
-            for name in names:
-                if not name.endswith(".py"):
-                    continue
-                rel = (Path(root) / name).relative_to(self.repo).as_posix()
-                mod = module_name(rel)
+        for rel in python_files(self.repo):
+            mod = module_name(rel)
+            if self.cache is not None:
+                parsed = self.cache.get(rel, parser)
+            else:
                 parsed = parser.parse_file(rel, (self.repo / rel).read_bytes())
 
-                self.files[mod] = parsed
-                self.top_level[mod] = {f.name: f for f in parsed.functions if "." not in f.qualname}
-                self.variables[mod] = {e.name: e for e in parsed.expressions}
-                for item in [*parsed.functions, *parsed.expressions]:
-                    if isinstance(item, FunctionInfo):
-                        node, kind = self.node_id(mod, item), "function"
-                        if "." not in item.qualname:          # only top-level functions are importable
-                            self.top_level[mod][item.name] = item
-                    else:
-                        node, kind = f"{mod}:{item.name}", "variable"
-                        self.variables[mod][item.name] = item
-                    self.graph.add_node(node, file=rel, start=item.start_line, end=item.end_line, kind=kind)
-
+            self.files[mod] = parsed
+            self.top_level[mod] = {}
+            self.variables[mod] = {}
+            for fn in parsed.functions:
+                if "." not in fn.qualname:          # only top-level functions are importable
+                    self.top_level[mod][fn.name] = fn
+                self.graph.add_node(self.node_id(mod, fn), file=rel, start=fn.start_line, end=fn.end_line,
+                                    kind="function")
+            for exp in parsed.expressions:
+                self.variables[mod][exp.name] = exp
+                self.graph.add_node(f"{mod}:{exp.name}", file=rel, start=exp.start_line, end=exp.end_line,
+                                    kind="variable")
+        if self.cache is not None:
+            self.cache.save()
 
     def resolve(self, mod: str, is_pkg: bool, parsed: ParsedFile, call) -> tuple[str, str] | None:
         if call.receiver is not None:
@@ -97,14 +117,15 @@ class Resolver:
                     self.stats[rule] += 1
                     self.graph.add_edge(caller, callee, resolution=rule, line=call.line)
 
+
     def build(self) -> nx.DiGraph:
         self.index()
         self.link()
         return self.graph
 
 def main():
-    r = Resolver(r"C:\Users\yashi\OneDrive\Documents\blast-radius\bench\targets\cat-hackathon")
-    r.index()
+    import sys
+    r = Resolver(sys.argv[1] if len(sys.argv) > 1 else ".")   # usage: python -m blast_radius.resolver.resolver [repo]
     print(r.build())
 
 if __name__ == "__main__":

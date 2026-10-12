@@ -8,15 +8,17 @@ import networkx as nx
 @dataclass
 class Impacted:
     node: str          # "pkg.service:get_user"
-    depth: int         # hops away from the change: 1 = direct caller
+    depth: int         # hops away from the change along the best-scored path: 1 = direct caller
     score: float       # 0 to 1: how likely it is to actually be affected
     path: list[str]    # changed function -> ... -> this node
     is_test: bool      # tests are what we'll actually run
 
 
+# Keep CONFIDENCE * DECAY <= 1 for every rule: the search relies on scores never growing along a path
 CONFIDENCE = {"local": 0.9, "import": 0.9}   # add a line here for each new resolver rule
 DEFAULT_CONFIDENCE = 0.5
 DECAY = 0.8
+MIN_SCORE = 0.05   # 0.72 ** 9 ~= 0.052, so a chain of strong edges stops after about 9 hops
 
 def is_test(graph: nx.DiGraph, node: str) -> bool:
     file = PurePosixPath(graph.nodes[node]["file"])
@@ -25,31 +27,26 @@ def is_test(graph: nx.DiGraph, node: str) -> bool:
     return in_test_file and func.startswith("test")
 
 
-def blast_radius(graph: nx.DiGraph, changed: set[str], max_depth: int = 6) -> list[Impacted]:
+def blast_radius(graph: nx.DiGraph, changed: set[str], min_score: float = MIN_SCORE) -> list[Impacted]:
     # heapq is a min-heap, so store -score to pop the HIGHEST score first
     heap = [(-1.0, 0, node, [node]) for node in changed if node in graph]
     heapq.heapify(heap)
-    reported: set[str] = set()
-    expanded_at: dict[str, int] = {}   # shallowest depth each node was expanded from
+    done: set[str] = set()
     results: list[Impacted] = []
 
     while heap:
         neg_score, depth, node, path = heapq.heappop(heap)
-        if expanded_at.get(node, max_depth + 1) <= depth:
-            continue                   # already expanded from here or shallower: nothing new to reach
-        expanded_at[node] = depth
+        if node in done:
+            continue                   # scores only shrink along a path, so the first pop was the best
+        done.add(node)
         score = -neg_score
-        if node not in reported:       # first pop = best score, so report that path
-            reported.add(node)
-            if depth > 0:              # depth 0 = the changed function itself, not an "impact"
-                results.append(Impacted(node, depth, round(score, 4), path, is_test(graph, node)))
-        # a worse-scored but shallower path still gets expanded, so max_depth doesn't hide callers
-        if depth == max_depth:
-            continue
+        if depth > 0:                  # depth 0 = the changed function itself, not an "impact"
+            results.append(Impacted(node, depth, round(score, 4), path, is_test(graph, node)))
         for caller in graph.predecessors(node):
-            if expanded_at.get(caller, max_depth + 1) <= depth + 1:
+            if caller in done:
                 continue
             rule = graph.edges[caller, node].get("resolution")
             new_score = score * CONFIDENCE.get(rule, DEFAULT_CONFIDENCE) * DECAY
-            heapq.heappush(heap, (-new_score, depth + 1, caller, [*path, caller]))
-    return results  
+            if new_score >= min_score:
+                heapq.heappush(heap, (-new_score, depth + 1, caller, [*path, caller]))
+    return results    # already ordered from highest to lowest score
