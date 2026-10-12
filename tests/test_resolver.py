@@ -302,3 +302,114 @@ def test_self_in_closure_inside_method(tmp_path):
 def test_self_outside_a_class_gives_no_edge(tmp_path):
     write(tmp_path, {"m.py": "def f(self):\n    self.save()\n\ndef save():\n    pass\n"})
     assert labelled_edges(tmp_path) == set()
+
+
+# ---- issue 11: calls on variables ---------------------------------------------------------------------
+
+MODELS = "class User:\n    def save(self):\n        pass\n\nclass Admin(User):\n    def save(self):\n        pass\n"
+
+
+def call_edges(root: Path, guess: bool = True) -> set[tuple[str, str, str]]:
+    g = Resolver(root, use_cache=False, guess=guess).build()
+    return {(a, b, d["resolution"]) for a, b, d in g.edges(data=True)
+            if d["resolution"] not in ("constructor", "inherits")}
+
+
+def test_annotation_names():
+    from blast_radius.resolver.resolver import annotation_names
+    assert annotation_names("User") == ["User"]
+    assert annotation_names("User | None") == ["User"]
+    assert annotation_names("Optional[User]") == ["User"]
+    assert annotation_names("typing.Optional['models.User']") == ["models.User"]
+    assert annotation_names('"User | Admin"') == ["User", "Admin"]
+    assert annotation_names("Annotated[User, Depends(x)]") == ["User"]
+    assert annotation_names("list[User]") == ["list"]          # the variable is the list, not a User
+    assert annotation_names("None") == []
+
+
+def test_variable_made_from_a_class(tmp_path):
+    write(tmp_path, {"models.py": MODELS,
+                     "api.py": "from models import User\n\ndef f():\n    u = User()\n    u.save()\n"})
+    assert call_edges(tmp_path) == {("api:f", "models:User.save", "typed"),
+                                    ("api:f", "models:Admin.save", "override")}
+
+
+def test_parameter_type_hint(tmp_path):
+    write(tmp_path, {"models.py": MODELS,
+                     "api.py": "from models import Admin\n\ndef f(a: Admin | None = None):\n    a.save()\n"})
+    assert call_edges(tmp_path) == {("api:f", "models:Admin.save", "typed")}
+
+
+def test_local_type_hint_and_return_type(tmp_path):
+    write(tmp_path, {
+        "models.py": MODELS + "\ndef load() -> 'Admin':\n    pass\n",
+        "api.py": "from models import Admin, load\n\ndef f():\n    a: Admin = get()\n    a.save()\n"
+                  "\ndef g():\n    b = load()\n    b.save()\n",
+    })
+    edges = call_edges(tmp_path)
+    assert ("api:f", "models:Admin.save", "typed") in edges
+    assert ("api:g", "models:Admin.save", "typed") in edges
+
+
+def test_self_attribute_from_init_parameter(tmp_path):
+    write(tmp_path, {
+        "models.py": MODELS,
+        "svc.py": "from models import Admin\n\nclass Svc:\n    def __init__(self, a: Admin):\n        self.a = a\n"
+                  "    def run(self):\n        self.a.save()\n",
+    })
+    assert call_edges(tmp_path) == {("svc:Svc.run", "models:Admin.save", "typed")}
+
+
+def test_self_attribute_from_class_body(tmp_path):
+    write(tmp_path, {
+        "models.py": MODELS,
+        "svc.py": "from models import Admin\n\nclass Svc:\n    a: Admin\n    def run(self):\n        self.a.save()\n",
+    })
+    assert call_edges(tmp_path) == {("svc:Svc.run", "models:Admin.save", "typed")}
+
+
+def test_variable_at_top_of_file(tmp_path):
+    write(tmp_path, {"models.py": MODELS,
+                     "api.py": "from models import Admin\n\nadmin = Admin()\n\ndef f():\n    admin.save()\n"})
+    assert call_edges(tmp_path) == {("api:f", "models:Admin.save", "typed")}
+
+
+def test_variable_copied_from_another(tmp_path):
+    write(tmp_path, {"models.py": MODELS,
+                     "api.py": "from models import Admin\n\ndef f(a: Admin):\n    b = a\n    b.save()\n"})
+    assert call_edges(tmp_path) == {("api:f", "models:Admin.save", "typed")}
+
+
+def test_third_party_type_gives_no_edge_and_no_guess(tmp_path):
+    write(tmp_path, {
+        "models.py": "class Store:\n    def commit(self):\n        pass\n",
+        "api.py": "from sqlalchemy.orm import Session\nimport requests\n\n"
+                  "def f(db: Session):\n    db.commit()\n\ndef g():\n    r = requests.get('x')\n    r.commit()\n",
+    })
+    assert call_edges(tmp_path) == set()
+
+
+def test_name_match_guess_and_switch(tmp_path):
+    write(tmp_path, {
+        "models.py": "class Report:\n    def publish(self):\n        pass\n",
+        "api.py": "def f(report):\n    report.publish()\n",
+    })
+    assert call_edges(tmp_path) == {("api:f", "models:Report.publish", "name-match")}
+    assert call_edges(tmp_path, guess=False) == set()
+
+
+def test_no_guess_when_several_classes_or_builtin_name(tmp_path):
+    write(tmp_path, {
+        "models.py": MODELS + "\nclass Cache:\n    def get(self):\n        pass\n",
+        "api.py": "def f(x):\n    x.save()\n    x.get()\n",     # save: two classes. get: dict has it too
+    })
+    assert call_edges(tmp_path) == set()
+
+
+def test_local_variable_hides_module_with_same_name(tmp_path):
+    write(tmp_path, {
+        "models.py": MODELS,
+        "db.py": "def save():\n    pass\n",
+        "api.py": "import db\nfrom models import Admin\n\ndef f():\n    db = Admin()\n    db.save()\n",
+    })
+    assert call_edges(tmp_path) == {("api:f", "models:Admin.save", "typed")}

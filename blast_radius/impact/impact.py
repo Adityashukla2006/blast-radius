@@ -25,6 +25,8 @@ CONFIDENCE = {   # add a line here for each new resolver rule
     "self": 0.9,          # self.validate(), written in the same class
     "inherited": 0.8,     # self.validate() or super().save(), written in a parent class
     "override": 0.5,      # self.validate() runs a child's version only when self is that child
+    "typed": 0.8,         # user.save(), where the code shows user is a User
+    "name-match": 0.3,    # user.save() with no clue about user: the only repo class with save()
 }
 DEFAULT_CONFIDENCE = 0.5
 DECAY = 0.8

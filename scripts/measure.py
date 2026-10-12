@@ -8,12 +8,14 @@ from blast_radius.analyze.analyze import Analyze
 from blast_radius.parser.parser import EXPR_RECEIVER
 from blast_radius.resolver.resolver import Resolver
 
-repo = sys.argv[1] if len(sys.argv) > 1 else "."   # usage: python scripts/measure.py [repo]
+args = [a for a in sys.argv[1:] if not a.startswith("--")]
+guess = "--no-guess" not in sys.argv     # usage: python scripts/measure.py [repo] [--no-guess]
+repo = args[0] if args else "."
 if not (Path(repo) / ".git").exists():
     sys.exit(f"{repo} is not a git repo checkout (clone it first, e.g. into bench/targets/)")
 
 # 1. How well does the resolver cover real code?
-r = Resolver(repo)
+r = Resolver(repo, guess=guess)
 g = r.build()
 total = sum(r.stats.values())
 print(f"Graph: {g.number_of_nodes()} functions, {g.number_of_edges()} edges")
@@ -41,7 +43,7 @@ for kind, n in kinds.most_common():
     print(f"  {n:6}  {kind}")
 
 # 3. What does the tool say about the current change?
-changed, impacted = Analyze.analyze(repo)
+changed, impacted = Analyze.analyze(repo, guess=guess)
 tests = [i for i in impacted if i.is_test]
 print(f"\nChanged: {sorted(changed)}")
 print(f"Impacted: {len(impacted)} functions, {len(tests)} tests")

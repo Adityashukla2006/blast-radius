@@ -6,7 +6,7 @@ class Analyze:
     def __init__(self):
         pass
     @staticmethod
-    def analyze(repo, base=None, min_score=MIN_SCORE, use_cache=True):
-        graph = Resolver(repo, use_cache).build()
+    def analyze(repo, base=None, min_score=MIN_SCORE, use_cache=True, guess=True):
+        graph = Resolver(repo, use_cache, guess).build()
         changed = changed_functions(graph, changed_lines(git_diff(repo, base)))
         return changed, blast_radius(graph, changed, min_score)

@@ -125,6 +125,29 @@ It also follows `import *`. It remembers every place it has been, so it can't go
 - Calls the tool can't place went from 78% to 66%.
 - New arrows: 293 `constructor`, 24 `module`, 9 `class`, 16 `inherits`.
 
+### 11. Calls on normal variables got no arrow
+**What was wrong:** `user = User()` then `user.save()`. The tool didn't know what kind of thing `user` is, so it drew no arrow.
+
+**How we fixed it – part 1, look for clues:**
+The tool looks in the code for a clue that tells it what the variable is:
+- `user = User()` – it is made from a class
+- `def f(user: User)` or `user: User = ...` – a type hint (also `User | None` and `Optional[User]`)
+- `user = load()`, where `def load() -> User` – the function says what it gives back
+- `self.db = Database()`, or `db: Database` in the class body – for `self.db.query()`
+- `tracker = Tracker()` at the top of the file
+- `b = a` – b is the same kind of thing as a
+If the clue points to something from outside the repo (like `db: Session` from SQLAlchemy), the tool draws no arrow. That is correct.
+
+**How we fixed it – part 2, guess (can be switched off):**
+If there is no clue at all, and exactly one class in the repo has a method with that name, the tool guesses that one.
+It never guesses names like `get` or `append`, because normal lists and dicts have those too.
+Guessed arrows get a low score (0.3). Switch it off with `Resolver(repo, guess=False)` or `measure.py --no-guess`.
+
+**Did it work?** Yes. In cat-hackathon:
+- Part 1 (clues): 87 more calls got an arrow.
+- Part 2 (guess): 46 more calls got an arrow. We checked them: they were right.
+  Most were test fixtures like `predictor` and `fake_llm`, which have no type hints.
+
 ### 26. `get_client().send()` looked like a plain `send()`
 **What was wrong:**
 When the part before the dot was not a simple name, the tool threw it away.
@@ -141,12 +164,6 @@ It is deleted now, and it was never saved into git.
 ---
 
 ## ⏳ To do
-
-### 11. Calls on normal variables get no arrow
-`user = get_user()` then `user.save()`. The tool doesn't know what kind of thing `user` is.
-This is the biggest group of missed calls (666 in cat-hackathon).
-**Plan (later):** Use simple clues: type hints like `user: User`, or `user = User()` in the same function.
-If only one class in the whole repo has a method with that name, add a weak arrow.
 
 ### 12. Two functions with the same name squash each other
 A `@property` getter and its setter have the same name. The second one overwrites the first one on the map.
@@ -189,6 +206,18 @@ This gives us a score. Then we can see if each fix really helps.
 
 ### 22. Only one arrow is kept between two functions
 If `a` calls `b` on three lines, the map keeps just the last line. This is small. It only matters for showing line numbers.
+
+### 27. Test fixtures could tell us the exact type
+In pytest, `def test_x(predictor):` gets `predictor` from a fixture function in `conftest.py`.
+That function often says what it gives back (`-> FakeLLM`), or it makes the object (`return ShadowPredictor.load()`).
+Right now the tool only guesses these by method name.
+**Plan:** Match the test's parameter name to the fixture function, and use what it gives back as the type.
+
+### 28. Some variables are still unknown
+These are not covered yet:
+- `for user in users:` and `with open(...) as f:`
+- two steps on a variable, like `user.profile.save()`
+- `get_client().send()` – the function's return type could tell us what `get_client()` gives back
 
 ### 23. A local function always wins over an imported one with the same name
 In Python, whichever comes later in the file wins. The tool always picks the local one. This is rare.

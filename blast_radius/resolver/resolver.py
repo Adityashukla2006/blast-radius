@@ -8,11 +8,59 @@ from pathlib import Path
 import networkx as nx
 
 from ..cache.cache import FALLBACK_DIR, ParseCache
-from ..parser.parser import EXPR_RECEIVER, CallSite, ClassInfo, Expression, FunctionInfo, ParsedFile, PythonParser
+from ..parser.parser import (
+    EXPR_RECEIVER,
+    CallSite,
+    ClassInfo,
+    Expression,
+    FunctionInfo,
+    ParsedFile,
+    PythonParser,
+    ValueHint,
+)
 
 SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "build", "dist", "node_modules", FALLBACK_DIR}
 MAX_HOPS = 20          # import hops find_symbol may follow before giving up
+MAX_TYPE_HOPS = 5      # x = y, y = z, ...: how far a variable's type is followed
 SELF_RECEIVERS = {"self", "cls"}
+# Methods that built-in types also have. A name-match guess on these would be wrong far too often.
+BUILTIN_METHODS = {n for t in (object, dict, list, set, frozenset, str, bytes, tuple, int, float) for n in dir(t)}
+# typing wrappers whose arguments are the real types: Optional[User] -> User
+TYPE_WRAPPERS = {"Optional", "Union", "Annotated", "Final", "ClassVar"}
+
+def _split_top(text: str, sep: str) -> list[str]:
+    """Split on sep, but not inside brackets: "dict[str, A], B" on "," -> ["dict[str, A]", " B"]."""
+    parts, depth, start = [], 0, 0
+    for i, ch in enumerate(text):
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        elif ch == sep and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return parts
+
+def annotation_names(text: str) -> list[str]:
+    """Class names a type hint can mean: "User | None" -> ["User"], "Optional['User']" -> ["User"].
+
+    A container like list[User] gives "list", not "User": the variable is the list, not a User.
+    """
+    names = []
+    for part in _split_top(text.strip().strip("'\""), "|"):
+        part = part.strip().strip("'\"")
+        if part.endswith("]") and "[" in part:
+            head, inner = part[: part.index("[")].strip(), part[part.index("[") + 1 : -1]
+            if head.split(".")[-1] in TYPE_WRAPPERS:
+                args = _split_top(inner, ",")
+                for arg in args[:1] if head.endswith("Annotated") else args:
+                    names += annotation_names(arg)
+                continue
+            part = head
+        if part and part != "None" and all(p.isidentifier() for p in part.split(".")):
+            names.append(part)
+    return names
 
 def python_files(repo: Path) -> list[str]:
     """Repo-relative .py paths. In a git checkout, .gitignore decides (so cloned bench targets stay out)."""
@@ -75,9 +123,13 @@ class Symbol:
 
 
 class Resolver:
-    def __init__(self, repo : str | Path, use_cache: bool = True):
+    def __init__(self, repo : str | Path, use_cache: bool = True, guess: bool = True):
         self.repo = Path(repo)
         self.cache = ParseCache(self.repo) if use_cache else None
+        self.guess = guess                    # False: no name-match edges, only ones the code proves
+        self.functions: dict[str, FunctionInfo] = {}          # node id -> function
+        self.methods: dict["Symbol", list[FunctionInfo]] = {}  # class -> methods written in its body
+        self.method_owners: dict[str, list[str]] = {}         # method name -> node ids of every such method
         self.files: dict[str, ParsedFile] = {}
         self.top_level: dict[str, dict[str, FunctionInfo]] = {}
         self.classes: dict[str, dict[str, ClassInfo]] = {}   # module -> class qualname -> class, nested too
@@ -114,6 +166,10 @@ class Resolver:
                     self.top_level[mod][fn.name] = fn
                 self.graph.add_node(self.node_id(mod, fn), file=rel, start=fn.start_line, end=fn.end_line,
                                     kind="function")
+                self.functions[self.node_id(mod, fn)] = fn
+                if fn.class_qualname is not None and fn.qualname == f"{fn.class_qualname}.{fn.name}":
+                    self.methods.setdefault(Symbol("class", mod, fn.class_qualname), []).append(fn)
+                    self.method_owners.setdefault(fn.name, []).append(self.node_id(mod, fn))
             for cls in parsed.classes:
                 self.classes[mod][cls.qualname] = cls
                 self.graph.add_node(f"{mod}:{cls.qualname}", file=rel, start=cls.start_line, end=cls.end_line,
@@ -271,6 +327,91 @@ class Resolver:
                     targets.append((method.node, "override"))
         return targets
 
+    # ---- variable types ----------------------------------------------------------------------------
+    # Each returns a list of repo classes, or None when the code gives no clue at all.
+    # [] means "there is a clue, and it is not a repo class" (db: Session): never guess then.
+
+    @staticmethod
+    def _combine(results) -> list[Symbol] | None:
+        results = list(results)
+        classes = [c for r in results if r for c in r]
+        if classes:
+            return list(dict.fromkeys(classes))     # keep order, drop repeats
+        return [] if any(r is not None for r in results) else None
+
+    def annotation_classes(self, module: str, text: str) -> list[Symbol]:
+        found = (self.resolve_dotted(module, name) for name in annotation_names(text))
+        return [s for s, _ in filter(None, found) if s.kind == "class"]
+
+    def hint_classes(self, module: str, fn: FunctionInfo | None, hint: ValueHint, hops: int) -> list[Symbol] | None:
+        if hint.kind == "annotation":                 # x: User
+            return self.annotation_classes(module, hint.text)
+        if hint.kind == "name":                       # x = other_variable
+            return None if "." in hint.text else self.var_types(module, fn, hint.text, hops + 1)
+        found = self.resolve_dotted(module, hint.text)  # x = User() or x = load()
+        if found is None:
+            first = hint.text.split(".")[0]
+            parsed = self.files[module]
+            if first in parsed.imports and self.canonical(
+                    absolute_module(module, self._is_pkg(module), parsed.imports[first][0])) is None:
+                return []                             # x = requests.get(): third-party value
+            return None
+        symbol = found[0]
+        if symbol.kind == "class":
+            return [symbol]
+        if symbol.kind == "function":
+            info = self.functions.get(symbol.node)
+            if info is not None and info.return_type:  # def load() -> User
+                return self.annotation_classes(symbol.module, info.return_type)
+        return None
+
+    def var_types(self, module: str, fn: FunctionInfo | None, name: str, hops: int = 0) -> list[Symbol] | None:
+        """Repo classes that variable `name` can hold inside `fn` (or at module level when fn is None)."""
+        if hops > MAX_TYPE_HOPS:
+            return None
+        if fn is not None:
+            if name in fn.params:                     # a parameter hides any outer name
+                annotation = fn.params[name]
+                return self.annotation_classes(module, annotation) if annotation else None
+            if name in fn.local_types:
+                return self._combine(self.hint_classes(module, fn, h, hops) for h in fn.local_types[name])
+        var = self.variables.get(module, {}).get(name)
+        if var is not None:
+            return self._combine(self.hint_classes(module, None, h, hops) for h in var.hints)
+        return None
+
+    def attr_types(self, cls: Symbol, attr: str) -> list[Symbol] | None:
+        """Repo classes that self.<attr> can hold, from the class body or any `self.attr = ...`."""
+        for c in self.mro(cls):                       # the nearest class that sets the attribute wins
+            hints = [(None, h) for h in self.classes[c.module][c.qualname].attrs.get(attr, [])]
+            for method in self.methods.get(c, []):
+                hints += [(method, h) for h in method.attr_assigns.get(attr, [])]
+            if hints:                                 # self.db = db reads the method's own parameter db
+                return self._combine(self.hint_classes(c.module, fn, h, 0) for fn, h in hints)
+        return None
+
+    def typed_targets(self, classes: list[Symbol] | None, name: str) -> list[tuple[str, str]]:
+        """Edges for <variable>.name() once we know which classes the variable can hold."""
+        if classes is None:
+            return self.guess_targets(name)
+        targets = []
+        for cls in classes:
+            method = self.find_member(cls, name)
+            if method is not None and method.kind == "function":
+                targets.append((method.node, "typed"))
+            for sub in self.descendants(cls):         # the value may be a subclass with its own version
+                own = self.own_method(sub, name)
+                if own is not None:
+                    targets.append((own.node, "override"))
+        return list(dict.fromkeys(targets))
+
+    def guess_targets(self, name: str) -> list[tuple[str, str]]:
+        """No clue about the type: if exactly one repo class has this method, guess it."""
+        if not self.guess or name.startswith("__") or name in BUILTIN_METHODS:
+            return []
+        owners = self.method_owners.get(name, [])
+        return [(owners[0], "name-match")] if len(owners) == 1 else []
+
     # ---- edges -------------------------------------------------------------------------------------
 
     def resolve(self, mod: str, is_pkg: bool, parsed: ParsedFile, call: CallSite,
@@ -283,10 +424,25 @@ class Resolver:
             return self.resolve_self(cls, call.name, is_super=call.receiver == "super()")
         if call.receiver == EXPR_RECEIVER:
             return []                       # get().send(): needs runtime knowledge
+
+        if call.receiver is not None:
+            first, *rest = call.receiver.split(".")
+            if first in SELF_RECEIVERS and len(rest) == 1:                 # self.db.query()
+                if caller is None or caller.class_qualname is None:
+                    return []
+                cls = Symbol("class", mod, caller.class_qualname)
+                return self.typed_targets(self.attr_types(cls, rest[0]), call.name)
+            if caller is not None and (first in caller.params or first in caller.local_types):
+                if rest:
+                    return []               # user.profile.save(): two steps, not followed
+                return self.typed_targets(self.var_types(mod, caller, first), call.name)
+
         dotted = call.name if call.receiver is None else f"{call.receiver}.{call.name}"
         found = self.resolve_dotted(mod, dotted)
         if found is None:
-            return []                       # builtins, third-party code, local variables
+            if call.receiver in self.variables.get(mod, {}):              # tracker = Tracker() at the top
+                return self.typed_targets(self.var_types(mod, None, call.receiver), call.name)
+            return []                       # builtins, third-party code
         symbol, label = found
         if symbol.kind == "function":
             return [(symbol.node, label)]
