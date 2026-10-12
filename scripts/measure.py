@@ -5,6 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # repo root, so this runs without installing
 
 from blast_radius.analyze.analyze import Analyze
+from blast_radius.parser.parser import EXPR_RECEIVER
 from blast_radius.resolver.resolver import Resolver
 
 repo = sys.argv[1] if len(sys.argv) > 1 else "."   # usage: python scripts/measure.py [repo]
@@ -26,13 +27,15 @@ for mod, parsed in r.files.items():
     is_pkg = parsed.path.endswith("__init__.py")
     for fn in parsed.functions:
         for call in fn.calls:
-            if r.resolve(mod, is_pkg, parsed, call) is None:
+            if not r.resolve(mod, is_pkg, parsed, call):
                 if call.receiver is None:
-                    kinds["bare name (builtins, classes, other)"] += 1
-                elif call.receiver in ("self", "cls"):
-                    kinds["self.method()"] += 1
+                    kinds["bare name (builtins, third-party)"] += 1
+                elif call.receiver in ("self", "cls", "super()"):
+                    kinds["self/cls/super().method()"] += 1
+                elif call.receiver == EXPR_RECEIVER:
+                    kinds["get().method() (needs runtime)"] += 1
                 else:
-                    kinds["x.method() / module.func()"] += 1
+                    kinds["x.method() (local variable, third-party)"] += 1
 print("\nUnresolved by kind:")
 for kind, n in kinds.most_common():
     print(f"  {n:6}  {kind}")

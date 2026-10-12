@@ -15,7 +15,14 @@ class Impacted:
 
 
 # Keep CONFIDENCE * DECAY <= 1 for every rule: the search relies on scores never growing along a path
-CONFIDENCE = {"local": 0.9, "import": 0.9}   # add a line here for each new resolver rule
+CONFIDENCE = {   # add a line here for each new resolver rule
+    "local": 0.9,         # query(), defined in the same file
+    "import": 0.9,        # query(), imported
+    "module": 0.9,        # db.query()
+    "class": 0.9,         # User.create()
+    "constructor": 0.9,   # User() -> the class and its __init__
+    "inherits": 0.9,      # class Student(User): Student -> User
+}
 DEFAULT_CONFIDENCE = 0.5
 DECAY = 0.8
 MIN_SCORE = 0.05   # 0.72 ** 9 ~= 0.052, so a chain of strong edges stops after about 9 hops

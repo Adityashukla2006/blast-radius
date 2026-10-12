@@ -17,15 +17,12 @@ Each function is a dot. Each arrow means "this function calls that function".
 
 ## 🔧 Working on it
 
-### Issues 7, 8, 9 and 10 – part 1 of 2 is done
-To fix these issues, the tool needs to know more about each file. So first we taught the parser to write down more things:
-- **Classes.** Their name, where they start and end, and their parent classes. For `class User(Base)`, the parent is `Base`.
-- **Which class a function lives in.** For `self.save()`, the tool must know that `self` means `User`.
-- **The full name before the dot.** For `app.db.query()`, the tool used to forget `app.db`. Now it keeps it.
-  For `super().save()`, it writes down `super()`.
-- **`from x import *` lines.** Many `__init__.py` files use these to pass names along.
-
-Part 2 is next: use all this new information to draw the missing arrows.
+### 7. `self.method()` calls get no arrow
+Inside a class, `self.save()` calls another method of the same class. The tool still skips these calls.
+So if you change a method, the tool may say nothing breaks. That is wrong.
+**Plan:** Find the class of the caller. Look for the method there. If it's not there, look in the parent classes.
+Also add weaker arrows to child classes that replace the method.
+The parser already writes down which class each function lives in, so this is the next step.
 
 ---
 
@@ -88,6 +85,36 @@ All fixed.
 ### 6. There were no tests
 **How we fixed it:** We added a `tests/` folder with tests for the search and for the memory box.
 
+### 8. `module.func()` calls got no arrow
+**What was wrong:** `import db` then `db.query()` – the tool skipped every call with a dot in it.
+
+**How we fixed it:** The tool now reads the name before the dot one piece at a time.
+`app.db.query` → first find `app`, then `db` inside it, then `query` inside that.
+Each piece can be a file, a class, or a function. If a piece is a local variable or an outside library, the tool stops and doesn't guess.
+
+### 9. `Foo()` did not connect to anything
+**What was wrong:** Making a new object runs its `__init__` method, but the tool didn't know that.
+Also, classes were not dots on the map. So changing a line inside a class (not inside a method) looked like no change at all.
+
+**How we fixed it:**
+- Every class is now a dot on the map.
+- `Foo()` draws an arrow to the class `Foo`, and also to its `__init__` (or to the parent class's `__init__`).
+- A class like `class Student(User)` draws an arrow `Student` → `User`, labelled `inherits`.
+  So if you change `User`, the tool also finds the code that uses `Student`.
+- `User.create()` draws an arrow to the method `User.create`, also if a parent class has it.
+
+### 10. Imports that passed through `__init__.py` got lost
+**What was wrong:** `pkg/__init__.py` says `from .core import run`. Another file says `from pkg import run`.
+The tool looked for `run` in `pkg` only, and didn't follow it to `pkg.core`.
+
+**How we fixed it:** A new lookup follows each import step by step until it finds where the name is really written.
+It also follows `import *`. It remembers every place it has been, so it can't go round in circles.
+
+**Did it work? (issues 8, 9 and 10 together)** Yes. In cat-hackathon:
+- The arrows went from 518 to 860.
+- Calls the tool can't place went from 78% to 66%.
+- New arrows: 293 `constructor`, 24 `module`, 9 `class`, 16 `inherits`.
+
 ### 26. `get_client().send()` looked like a plain `send()`
 **What was wrong:**
 When the part before the dot was not a simple name, the tool threw it away.
@@ -105,25 +132,6 @@ It is deleted now, and it was never saved into git.
 
 ## ⏳ To do
 
-### 7. `self.method()` calls get no arrow
-Inside a class, `self.save()` calls another method of the same class. The tool skips every call with a dot in it.
-So if you change a method, the tool says nothing breaks. That is wrong.
-**Plan:** Find the class of the caller. Look for the method there. If it's not there, look in the parent classes.
-Also add weaker arrows to child classes that replace the method.
-
-### 8. `module.func()` calls get no arrow
-`import db` then `db.query()` – the tool skips this too, because of the dot.
-**Plan:** If the part before the dot is an imported module from the repo, look for the function inside it.
-
-### 9. `Foo()` does not connect to `Foo.__init__`
-Making a new object runs its `__init__` method. The tool doesn't know that.
-**Plan:** If a call's name is a class, add an arrow to its `__init__` (or the parent class's `__init__`).
-
-### 10. Imports that pass through `__init__.py` get lost
-`pkg/__init__.py` says `from .core import run`. Another file says `from pkg import run`.
-The tool looks for `run` in `pkg` only, and doesn't follow it on to `pkg.core`.
-**Plan:** One lookup function that follows imports step by step, also `import *`. It remembers where it has been, so it can't go round in circles.
-
 ### 11. Calls on normal variables get no arrow
 `user = get_user()` then `user.save()`. The tool doesn't know what kind of thing `user` is.
 This is the biggest group of missed calls (666 in cat-hackathon).
@@ -134,7 +142,7 @@ If only one class in the whole repo has a method with that name, add a weak arro
 A `@property` getter and its setter have the same name. The second one overwrites the first one on the map.
 **Plan:** Give the second one a different name, like adding its line number.
 
-### 13. A function and a variable with the same name become one dot
+### 13. A function, a class and a variable with the same name become one dot
 `handler = wrap(handler)` – the function `handler` and the variable `handler` get the same name, so they merge.
 **Plan:** Give each kind its own name.
 
