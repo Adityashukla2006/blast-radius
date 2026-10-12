@@ -27,7 +27,7 @@ for mod, parsed in r.files.items():
     is_pkg = parsed.path.endswith("__init__.py")
     for fn in parsed.functions:
         for call in fn.calls:
-            if not r.resolve(mod, is_pkg, parsed, call):
+            if not r.resolve(mod, is_pkg, parsed, call, fn):
                 if call.receiver is None:
                     kinds["bare name (builtins, third-party)"] += 1
                 elif call.receiver in ("self", "cls", "super()"):

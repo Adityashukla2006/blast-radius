@@ -12,7 +12,7 @@ from ..parser.parser import EXPR_RECEIVER, CallSite, ClassInfo, Expression, Func
 
 SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "build", "dist", "node_modules", FALLBACK_DIR}
 MAX_HOPS = 20          # import hops find_symbol may follow before giving up
-NOT_RESOLVED_HERE = {"self", "cls", "super()", EXPR_RECEIVER}   # self/cls/super() come in step 4
+SELF_RECEIVERS = {"self", "cls"}
 
 def python_files(repo: Path) -> list[str]:
     """Repo-relative .py paths. In a git checkout, .gitignore decides (so cloned bench targets stay out)."""
@@ -87,6 +87,7 @@ class Resolver:
         self.aliases: dict[str, str] = {}     # import name -> module name, e.g. "app.db" -> "backend.app.db"
         self.ambiguous: set[str] = set()      # import names that more than one file claims: never used
         self._bases: dict[Symbol, list[Symbol]] = {}
+        self._children: dict[Symbol, list[Symbol]] = {}   # direct subclasses in this repo, filled by link()
 
     @staticmethod
     def node_id(module: str, fn: FunctionInfo) -> str:
@@ -223,22 +224,65 @@ class Resolver:
             yield current
             stack.extend(reversed(self.bases(current)))
 
+    def own_method(self, cls: Symbol, name: str) -> Symbol | None:
+        """A method written in the body of `cls` itself, not inherited."""
+        qualname = f"{cls.qualname}.{name}"
+        if self.graph.nodes.get(f"{cls.module}:{qualname}", {}).get("kind") == "function":
+            return Symbol("function", cls.module, qualname)
+        return None
+
     def find_member(self, cls: Symbol, name: str) -> Symbol | None:
         """A method or nested class of `cls`, also when a parent class defines it."""
         for c in self.mro(cls):
+            method = self.own_method(c, name)
+            if method is not None:
+                return method
             qualname = f"{c.qualname}.{name}"
-            if self.graph.nodes.get(f"{c.module}:{qualname}", {}).get("kind") == "function":
-                return Symbol("function", c.module, qualname)
             if qualname in self.classes[c.module]:
                 return Symbol("class", c.module, qualname)
         return None
 
+    def descendants(self, cls: Symbol) -> Iterator[Symbol]:
+        """Every subclass of `cls` in this repo: children, grandchildren, and so on."""
+        stack, seen = list(self._children.get(cls, [])), {cls}
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            yield current
+            stack.extend(self._children.get(current, []))
+
+    def resolve_self(self, cls: Symbol, name: str, is_super: bool) -> list[tuple[str, str]]:
+        """self.name() / cls.name() / super().name() called inside class `cls`."""
+        targets = []
+        for c in self.mro(cls):
+            if is_super and c == cls:
+                continue                    # super() starts looking at the parents
+            method = self.own_method(c, name)
+            if method is not None:
+                targets.append((method.node, "self" if c == cls else "inherited"))
+                break
+        if not is_super:
+            # self may be a subclass instance, and then the subclass's own version runs instead
+            for sub in self.descendants(cls):
+                method = self.own_method(sub, name)
+                if method is not None:
+                    targets.append((method.node, "override"))
+        return targets
+
     # ---- edges -------------------------------------------------------------------------------------
 
-    def resolve(self, mod: str, is_pkg: bool, parsed: ParsedFile, call: CallSite) -> list[tuple[str, str]]:
+    def resolve(self, mod: str, is_pkg: bool, parsed: ParsedFile, call: CallSite,
+                caller: FunctionInfo | None = None) -> list[tuple[str, str]]:
         """Targets of one call as (node, label). Empty when the call can't be resolved."""
-        if call.receiver in NOT_RESOLVED_HERE:
-            return []
+        if call.receiver in SELF_RECEIVERS or call.receiver == "super()":
+            if caller is None or caller.class_qualname is None:
+                return []                   # `self` outside a class: just a parameter with that name
+            cls = Symbol("class", mod, caller.class_qualname)
+            return self.resolve_self(cls, call.name, is_super=call.receiver == "super()")
+        if call.receiver == EXPR_RECEIVER:
+            return []                       # get().send(): needs runtime knowledge
         dotted = call.name if call.receiver is None else f"{call.receiver}.{call.name}"
         found = self.resolve_dotted(mod, dotted)
         if found is None:
@@ -261,13 +305,14 @@ class Resolver:
                 for base in self.bases(cls):     # a change to the parent class reaches its children
                     self.graph.add_edge(cls.node, base.node, resolution="inherits",
                                         line=classes[qualname].start_line)
+                    self._children.setdefault(base, []).append(cls)
 
         for mod, parsed in self.files.items():
             is_pkg = parsed.path.endswith("__init__.py")
             for fn in parsed.functions:
                 caller = self.node_id(mod, fn)
                 for call in fn.calls:
-                    targets = self.resolve(mod, is_pkg, parsed, call)
+                    targets = self.resolve(mod, is_pkg, parsed, call, fn)
                     if not targets:
                         self.stats["unresolved"] += 1
                         continue

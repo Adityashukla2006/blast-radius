@@ -219,9 +219,86 @@ def test_calls_that_stay_unresolved(tmp_path):
             "        user = load()\n"
             "        user.save()\n"           # local variable
             "        get().query()\n"         # needs runtime knowledge
-            "        self.m()\n"              # self: step 4
+            "        self.db.query()\n"       # attribute of self: its type is unknown
             "        query.attr()\n"          # attribute of a function
         ),
     })
     r = Resolver(tmp_path, use_cache=False)
     assert set(r.build().edges) == set()
+
+
+# ---- step 4: self, cls, super() ----------------------------------------------------------------------
+
+def test_self_call_in_same_class(tmp_path):
+    write(tmp_path, {
+        "m.py": "class User:\n    def save(self):\n        self.validate()\n    def validate(self):\n        pass\n",
+    })
+    assert labelled_edges(tmp_path) == {("m:User.save", "m:User.validate", "self")}
+
+
+def test_cls_call_in_classmethod(tmp_path):
+    write(tmp_path, {
+        "m.py": "class User:\n    @classmethod\n    def load(cls):\n        cls.make()\n"
+                "    @classmethod\n    def make(cls):\n        pass\n",
+    })
+    assert labelled_edges(tmp_path) == {("m:User.load", "m:User.make", "self")}
+
+
+def test_self_call_to_parent_method_in_other_file(tmp_path):
+    write(tmp_path, {
+        "base.py": "class User:\n    def validate(self):\n        pass\n",
+        "school.py": "from base import User\n\nclass Student(User):\n    def save(self):\n        self.validate()\n",
+    })
+    assert ("school:Student.save", "base:User.validate", "inherited") in labelled_edges(tmp_path)
+
+
+def test_super_skips_own_class_and_adds_no_overrides(tmp_path):
+    write(tmp_path, {
+        "m.py": (
+            "class User:\n    def save(self):\n        pass\n\n"
+            "class Student(User):\n    def save(self):\n        super().save()\n\n"
+            "class Monitor(Student):\n    def save(self):\n        pass\n"
+        ),
+    })
+    calls = {e for e in labelled_edges(tmp_path) if e[2] != "inherits"}
+    assert calls == {("m:Student.save", "m:User.save", "inherited")}
+
+
+def test_override_in_child_class(tmp_path):
+    write(tmp_path, {
+        "m.py": (
+            "class User:\n    def save(self):\n        self.validate()\n    def validate(self):\n        pass\n\n"
+            "class Student(User):\n    def validate(self):\n        pass\n\n"
+            "class Monitor(Student):\n    def validate(self):\n        pass\n"
+        ),
+    })
+    calls = {e for e in labelled_edges(tmp_path) if e[2] != "inherits"}
+    assert calls == {
+        ("m:User.save", "m:User.validate", "self"),
+        ("m:User.save", "m:Student.validate", "override"),
+        ("m:User.save", "m:Monitor.validate", "override"),     # grandchildren count too
+    }
+
+
+def test_method_only_children_define(tmp_path):
+    # the "template method" pattern: the parent calls a step that only the children write
+    write(tmp_path, {
+        "m.py": (
+            "class Job:\n    def run(self):\n        self.step()\n\n"
+            "class Email(Job):\n    def step(self):\n        pass\n"
+        ),
+    })
+    calls = {e for e in labelled_edges(tmp_path) if e[2] != "inherits"}
+    assert calls == {("m:Job.run", "m:Email.step", "override")}
+
+
+def test_self_in_closure_inside_method(tmp_path):
+    write(tmp_path, {
+        "m.py": "class A:\n    def m(self):\n        def helper():\n            self.n()\n    def n(self):\n        pass\n",
+    })
+    assert ("m:A.m.helper", "m:A.n", "self") in labelled_edges(tmp_path)
+
+
+def test_self_outside_a_class_gives_no_edge(tmp_path):
+    write(tmp_path, {"m.py": "def f(self):\n    self.save()\n\ndef save():\n    pass\n"})
+    assert labelled_edges(tmp_path) == set()

@@ -22,6 +22,9 @@ CONFIDENCE = {   # add a line here for each new resolver rule
     "class": 0.9,         # User.create()
     "constructor": 0.9,   # User() -> the class and its __init__
     "inherits": 0.9,      # class Student(User): Student -> User
+    "self": 0.9,          # self.validate(), written in the same class
+    "inherited": 0.8,     # self.validate() or super().save(), written in a parent class
+    "override": 0.5,      # self.validate() runs a child's version only when self is that child
 }
 DEFAULT_CONFIDENCE = 0.5
 DECAY = 0.8

@@ -17,12 +17,7 @@ Each function is a dot. Each arrow means "this function calls that function".
 
 ## 🔧 Working on it
 
-### 7. `self.method()` calls get no arrow
-Inside a class, `self.save()` calls another method of the same class. The tool still skips these calls.
-So if you change a method, the tool may say nothing breaks. That is wrong.
-**Plan:** Find the class of the caller. Look for the method there. If it's not there, look in the parent classes.
-Also add weaker arrows to child classes that replace the method.
-The parser already writes down which class each function lives in, so this is the next step.
+Nothing right now.
 
 ---
 
@@ -84,6 +79,21 @@ All fixed.
 
 ### 6. There were no tests
 **How we fixed it:** We added a `tests/` folder with tests for the search and for the memory box.
+
+### 7. `self.method()` calls got no arrow
+**What was wrong:** Inside a class, `self.save()` calls another method of the same class. The tool skipped these calls.
+So if you changed a method, the tool could say nothing breaks.
+
+**How we fixed it:**
+- `self.save()` and `cls.make()`: the tool finds the class the caller lives in, and looks for the method there (label `self`).
+  If the class doesn't have it, it looks in the parent classes (label `inherited`).
+- `super().save()`: the tool skips the caller's own class and looks only in the parents (label `inherited`).
+- Child classes can replace a method. Then `self.validate()` can run the child's version.
+  So the tool also draws a weaker arrow to every child's version (label `override`).
+  This also works when only the children have the method, and for grandchildren.
+
+**Did it work?** Yes. In cat-hackathon, 27 of the 28 `self` calls now get an arrow.
+The last one, `self._sleep()`, is not a method. It is a function stored in a variable, so the tool is right to skip it.
 
 ### 8. `module.func()` calls got no arrow
 **What was wrong:** `import db` then `db.query()` – the tool skipped every call with a dot in it.
