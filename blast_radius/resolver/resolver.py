@@ -34,6 +34,18 @@ def module_name(rel_path : str) -> str:
         parts = parts[:-1]
     return ".".join(parts)
 
+def import_name(rel_path: str, py_files: set[str]) -> str:
+    """The name Python imports a file by: the path from the folder above its top package.
+
+    backend/app/db.py -> "app.db" when backend/app/__init__.py exists but backend/__init__.py does not,
+    because the code runs from inside backend/ and writes `from app.db import ...`.
+    """
+    parts = Path(rel_path).parts
+    start = len(parts) - 1                    # index of the first path part kept; the file itself always stays
+    while start > 0 and "/".join([*parts[:start], "__init__.py"]) in py_files:
+        start -= 1                            # this folder is a package, so its name is part of the import name
+    return module_name("/".join(parts[start:]))
+
 def absolute_module(importer: str, is_package: bool, target: str) -> str:
     if not target.startswith("."):
         return target                              # already absolute: 'os', 'pkg.db'
@@ -53,7 +65,9 @@ class Resolver:
         self.top_level: dict[str, dict[str, FunctionInfo]] = {}
         self.graph = nx.DiGraph()
         self.stats: Counter = Counter()
-        self.variables: dict[str, dict[str, Expression]] = {} 
+        self.variables: dict[str, dict[str, Expression]] = {}
+        self.aliases: dict[str, str] = {}     # import name -> module name, e.g. "app.db" -> "backend.app.db"
+        self.ambiguous: set[str] = set()      # import names that more than one file claims: never used
 
     @staticmethod
     def node_id(module: str, fn: FunctionInfo) -> str:
@@ -61,8 +75,11 @@ class Resolver:
 
     def index(self) -> None:
         parser = PythonParser()
-        for rel in python_files(self.repo):
+        rels = python_files(self.repo)
+        py_files = set(rels)
+        for rel in rels:
             mod = module_name(rel)
+            self._add_alias(import_name(rel, py_files), mod)
             if self.cache is not None:
                 parsed = self.cache.get(rel, parser)
             else:
@@ -83,6 +100,19 @@ class Resolver:
         if self.cache is not None:
             self.cache.save()
 
+    def _add_alias(self, name: str, mod: str) -> None:
+        if name == mod or name in self.ambiguous:
+            return
+        if self.aliases.setdefault(name, mod) != mod:   # a second file wants the same name
+            del self.aliases[name]
+            self.ambiguous.add(name)                    # a wrong edge is worse than a missing one
+
+    def canonical(self, name: str) -> str | None:
+        """Module name for an import name, or None when it is not code in this repo (or is ambiguous)."""
+        if name in self.files:
+            return name
+        return self.aliases.get(name)
+
     def resolve(self, mod: str, is_pkg: bool, parsed: ParsedFile, call) -> tuple[str, str] | None:
         if call.receiver is not None:
             return None   # attribute calls come in later rules
@@ -96,8 +126,8 @@ class Resolver:
         if call.name in parsed.imports:
             src, symbol = parsed.imports[call.name]
             if symbol is not None:   # None means "import x" (a module), not a function
-                src_mod = absolute_module(mod, is_pkg, src)
-                fn = self.top_level.get(src_mod, {}).get(symbol)
+                src_mod = self.canonical(absolute_module(mod, is_pkg, src))
+                fn = self.top_level.get(src_mod, {}).get(symbol) if src_mod else None
                 if fn is not None:
                     return self.node_id(src_mod, fn), "import"
 
