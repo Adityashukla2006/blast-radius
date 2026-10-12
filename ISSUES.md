@@ -17,7 +17,15 @@ Each function is a dot. Each arrow means "this function calls that function".
 
 ## 🔧 Working on it
 
-Nothing right now. Next up: issue 7.
+### Issues 7, 8, 9 and 10 – part 1 of 2 is done
+To fix these issues, the tool needs to know more about each file. So first we taught the parser to write down more things:
+- **Classes.** Their name, where they start and end, and their parent classes. For `class User(Base)`, the parent is `Base`.
+- **Which class a function lives in.** For `self.save()`, the tool must know that `self` means `User`.
+- **The full name before the dot.** For `app.db.query()`, the tool used to forget `app.db`. Now it keeps it.
+  For `super().save()`, it writes down `super()`.
+- **`from x import *` lines.** Many `__init__.py` files use these to pass names along.
+
+Part 2 is next: use all this new information to draw the missing arrows.
 
 ---
 
@@ -79,6 +87,15 @@ All fixed.
 
 ### 6. There were no tests
 **How we fixed it:** We added a `tests/` folder with tests for the search and for the memory box.
+
+### 26. `get_client().send()` looked like a plain `send()`
+**What was wrong:**
+When the part before the dot was not a simple name, the tool threw it away.
+So `get_client().send()` looked just like `send()`. If the file had its own function called `send`, the tool drew an arrow to it. That arrow was wrong.
+
+**How we fixed it:** Now the tool writes down `<expr>` for that part. It knows it is not a plain call, so it does not guess.
+
+**Did it work?** Yes. In cat-hackathon, 341 calls were wrongly counted as plain calls. Now they are not. One wrong arrow went away.
 
 ### 24. A secret was inside `blast_radius/resolver/ok.py`
 This file had nothing to do with the project, and it had a secret token in it.

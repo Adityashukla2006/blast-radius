@@ -14,6 +14,17 @@ FUNCTION_QUERY = Query(
 )
 CALL_QUERY = Query(PY_LANGUAGE, "(call function: (_) @callee) @call")
 
+CLASS_QUERY = Query(
+    PY_LANGUAGE,
+    """
+    (class_definition
+        name: (identifier) @name
+    ) @class
+    """,
+)
+
+EXPR_RECEIVER = "<expr>"   # receiver that is not a plain name chain: get_client().send(), items[0].save()
+
 EXPRESSION_QUERY = Query(
     PY_LANGUAGE,
 
@@ -31,7 +42,7 @@ EXPRESSION_QUERY = Query(
 @dataclass
 class CallSite:
     name: str
-    receiver: str | None
+    receiver: str | None   # None: bare call. "self", "app.db", "super()", or EXPR_RECEIVER
     line: int
 
 @dataclass
@@ -47,6 +58,15 @@ class FunctionInfo:
     start_line: int   
     end_line: int
     calls: list[CallSite] = field(default_factory=list)
+    class_qualname: str | None = None   # nearest enclosing class, so `self` inside it means that class
+
+@dataclass
+class ClassInfo:
+    name: str
+    qualname: str
+    start_line: int
+    end_line: int
+    bases: list[str] = field(default_factory=list)   # as written: ["Base", "models.Model"]
 
 @dataclass
 class ParsedFile:
@@ -54,6 +74,8 @@ class ParsedFile:
     functions: list[FunctionInfo]
     imports: dict[str, tuple[str, str | None]]
     expressions : list[Expression] = field(default_factory = list)
+    classes: list[ClassInfo] = field(default_factory=list)
+    star_imports: list[str] = field(default_factory=list)   # modules in `from X import *`, dots kept
 
 def _text(node: Node, field_name: str) -> str:
     child = node.child_by_field_name(field_name)
@@ -67,14 +89,44 @@ def _innermost_function(node: Node) -> Node | None:
         parent = parent.parent
     return None
 
+def _dotted(node: Node) -> str | None:
+    """`app.db` -> "app.db"; None when any part is not a plain name, like `get().db` or `x[0].db`."""
+    if node.type == "identifier":
+        return node.text.decode()
+    if node.type == "attribute":
+        obj = _dotted(node.child_by_field_name("object"))
+        return f"{obj}.{_text(node, 'attribute')}" if obj is not None else None
+    return None
+
+def _receiver(obj: Node) -> str:
+    if obj.type == "call" and _text(obj, "function") == "super":
+        return "super()"                      # super().save(): the parent class's method
+    return _dotted(obj) or EXPR_RECEIVER
+
 def _call_site(callee: Node, line: int) -> CallSite | None:
     if callee.type == "identifier":  # query(...)
         return CallSite(callee.text.decode(), None, line)
-    if callee.type == "attribute":  # user.save(...), get_client().send(...)
-        obj = callee.child_by_field_name("object")
-        receiver = obj.text.decode() if obj.type == "identifier" else None
+    if callee.type == "attribute":  # user.save(...), app.db.query(...), get_client().send(...)
+        receiver = _receiver(callee.child_by_field_name("object"))
         return CallSite(_text(callee, "attribute"), receiver, line)
     return None  # funcs[0](), (lambda: 1)(): not statically nameable
+
+def _span(node: Node) -> Node:
+    """Include the decorators, so a change to `@app.get(...)` maps to the function below it."""
+    return node.parent if node.parent.type == "decorated_definition" else node
+
+def _base_names(class_node: Node) -> list[str]:
+    args = class_node.child_by_field_name("superclasses")
+    if args is None:
+        return []
+    bases = []
+    for arg in args.named_children:           # keyword_argument (metaclass=...) is skipped
+        if arg.type == "subscript":           # Base[T] -> Base
+            arg = arg.child_by_field_name("value")
+        name = _dotted(arg)
+        if name is not None:
+            bases.append(name)
+    return bases
 
 class PythonParser:
     def __init__(self):
@@ -88,7 +140,9 @@ class PythonParser:
         exp = self._get_expressions(root)
         by_node = self._get_functions(root)
         self._attach_calls(root, by_node)
-        return ParsedFile(path, list(by_node.values()), self._collect_imports(root),list(exp.values()))
+        imports, star_imports = self._collect_imports(root)
+        return ParsedFile(path, list(by_node.values()), imports, list(exp.values()),
+                          classes=self._get_classes(root), star_imports=star_imports)
     
     def _get_expressions(self, root : Node) -> dict[int, Expression]:
         exp : dict[int, Expression] = {}
@@ -107,7 +161,7 @@ class PythonParser:
         for _, captures in QueryCursor(FUNCTION_QUERY).matches(root):
             fn_node = captures["function"][0]
             name = captures["name"][0].text.decode()
-            span = fn_node.parent if fn_node.parent.type == "decorated_definition" else fn_node
+            span = _span(fn_node)
 
             # keyed by the function_definition node (not the decorated span) to match _innermost_function
             results[fn_node.start_byte] = FunctionInfo(
@@ -115,8 +169,34 @@ class PythonParser:
                 qualname=".".join([*self._enclosing_scopes(fn_node), name]),
                 start_line=span.start_point.row + 1,
                 end_line=span.end_point.row + 1,
+                class_qualname=self._enclosing_class(fn_node),
             )
         return results
+
+    def _get_classes(self, root: Node) -> list[ClassInfo]:
+        classes = []
+        for _, captures in QueryCursor(CLASS_QUERY).matches(root):
+            cls_node = captures["class"][0]
+            name = captures["name"][0].text.decode()
+            span = _span(cls_node)
+            classes.append(ClassInfo(
+                name=name,
+                qualname=".".join([*self._enclosing_scopes(cls_node), name]),
+                start_line=span.start_point.row + 1,
+                end_line=span.end_point.row + 1,
+                bases=_base_names(cls_node),
+            ))
+        return classes
+
+    @classmethod
+    def _enclosing_class(cls, node: Node) -> str | None:
+        """Qualname of the nearest class around node, also through nested functions (closures keep `self`)."""
+        parent = node.parent
+        while parent is not None:
+            if parent.type == "class_definition":
+                return ".".join([*cls._enclosing_scopes(parent), _text(parent, "name")])
+            parent = parent.parent
+        return None
 
     @staticmethod
     def _enclosing_scopes(node : Node):
@@ -139,8 +219,9 @@ class PythonParser:
                 by_node[owner.start_byte].calls.append(site)
 
 
-    def _collect_imports(self, root: Node) -> dict[str, tuple[str, str | None]]:
+    def _collect_imports(self, root: Node) -> tuple[dict[str, tuple[str, str | None]], list[str]]:
         imports: dict[str, tuple[str, str | None]] = {}
+        star_imports: list[str] = []
         for node in root.children:  # top-level only; function-local imports can come later
             if node.type == "import_statement":
                 for child in node.named_children:
@@ -151,12 +232,15 @@ class PythonParser:
                         imports[_text(child, "alias")] = (_text(child, "name"), None)
             elif node.type == "import_from_statement":
                 module = _text(node, "module_name")  # keeps leading dots: ".db"
+                if any(child.type == "wildcard_import" for child in node.children):
+                    star_imports.append(module)      # from x import *
+                    continue
                 for child in node.children_by_field_name("name"):
                     if child.type == "aliased_import":  # from x import y as z
                         imports[_text(child, "alias")] = (module, _text(child, "name"))
                     else:  # from x import y
                         imports[child.text.decode()] = (module, child.text.decode())
-        return imports
+        return imports, star_imports
 
 # def main():
 #     p = PythonParser()
